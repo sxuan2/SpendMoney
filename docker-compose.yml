@@ -1,0 +1,26 @@
+version: '3.8'
+name: spendmoney_stack
+
+services:
+  app:
+    container_name: spendmoney_app
+    build: .
+    restart: always
+    expose:
+      - "8000"
+    environment:
+      - SPENDMONEY_API_KEY=8nsYwBUAGlO-bOZEqFgEuUEiDJJRXR0X_ZHWNl3PD4Q
+    networks:
+      - default
+      - portal_stack_default
+    volumes:
+      - ./finance.db:/app/finance.db
+      - ./uploaded_receipts:/app/uploaded_receipts
+      - ./processed_receipts:/app/processed_receipts
+      - ./logs:/app/logs
+
+
+
+networks:
+  portal_stack_default:
+    external: true
