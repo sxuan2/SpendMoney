@@ -5,12 +5,14 @@ import sqlite3
 import uuid
 import json
 import datetime
+import csv
+import io
 from html import escape
 from urllib.parse import quote
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, UploadFile, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from database import init_db
 from processor import process_receipt_file, UPLOAD_DIR, PROCESSED_DIR
@@ -56,6 +58,21 @@ def get_category_map():
     cmap = {row[0]: row[1] for row in cursor.fetchall()}
     conn.close()
     return cmap
+
+def format_export_date(value):
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    try:
+        return datetime.date.fromisoformat(value[:10]).isoformat()
+    except ValueError:
+        return value[:10]
+
+def format_export_amount(value):
+    try:
+        return f"{float(value or 0):.2f}"
+    except (TypeError, ValueError):
+        return "0.00"
 
 COMMON_HEAD = """
     <meta charset="utf-8">
@@ -201,20 +218,27 @@ async def render_dashboard(month: Optional[str] = None):
         last_6_months.append(f"{y:04d}-{m:02d}")
     
     cutoff_month = last_6_months[0]
-    cursor.execute("""
-        SELECT substr(date, 1, 7) as month, SUM(amount) 
-        FROM records 
-        WHERE status = 'confirmed' AND date != '' AND substr(date, 1, 7) >= ?
-        GROUP BY month 
-        ORDER BY month ASC
-    """, (cutoff_month,))
-    
-    trend_data = cursor.fetchall()
     trend_dict = {m: 0.0 for m in last_6_months}
-    for r in trend_data:
-        m_str, amt = r[0], r[1]
-        if m_str in trend_dict:
-            trend_dict[m_str] = amt
+    cursor.execute("""
+        SELECT date, amount, COALESCE(amortization_months, 1)
+        FROM records
+        WHERE status = 'confirmed' AND date != ''
+    """)
+    confirmed_records = cursor.fetchall()
+
+    def add_months(month_text, offset):
+        year, month_number = map(int, month_text.split("-"))
+        absolute_month = year * 12 + month_number - 1 + offset
+        return f"{absolute_month // 12:04d}-{absolute_month % 12 + 1:02d}"
+
+    for record_date, record_amount, amortization_months in confirmed_records:
+        start_month = str(record_date)[:7]
+        months = max(1, int(amortization_months or 1))
+        monthly_amount = (record_amount or 0.0) / months
+        for offset in range(months):
+            target_month = add_months(start_month, offset)
+            if target_month in trend_dict:
+                trend_dict[target_month] += monthly_amount
             
     dates = list(trend_dict.keys())
     amounts = list(trend_dict.values())
@@ -238,14 +262,20 @@ async def render_dashboard(month: Optional[str] = None):
     
     # 3. 抓取选定月份的聚合分类数据
     cursor.execute("""
-        SELECT COALESCE(c.name, r.category) as cat_name, SUM(r.amount) as t 
-        FROM records r 
-        LEFT JOIN categories c ON r.category = c.code 
-        WHERE r.status = 'confirmed' AND r.date LIKE ? 
-        GROUP BY cat_name 
-        ORDER BY t DESC
-    """, (f"{selected_month}%",))
-    month_category_data = cursor.fetchall()
+        SELECT r.date, r.amount, COALESCE(r.amortization_months, 1),
+               COALESCE(c.name, r.category)
+        FROM records r
+        LEFT JOIN categories c ON r.category = c.code
+        WHERE r.status = 'confirmed' AND r.date != ''
+    """)
+    category_totals = {}
+    for record_date, record_amount, amortization_months, cat_name in cursor.fetchall():
+        start_month = str(record_date)[:7]
+        months = max(1, int(amortization_months or 1))
+        covered_months = (add_months(start_month, offset) for offset in range(months))
+        if selected_month in covered_months:
+            category_totals[cat_name] = category_totals.get(cat_name, 0.0) + (record_amount or 0.0) / months
+    month_category_data = sorted(category_totals.items(), key=lambda item: item[1], reverse=True)
     category_pie = [{"name": r[0] if r[0] else "未知代码", "value": r[1]} for r in month_category_data]
     
     # 4. 组装月度分类汇总表 HTML
@@ -266,7 +296,7 @@ async def render_dashboard(month: Optional[str] = None):
     else:
         table_rows += f"""
             <tr style="background: #fafafa;">
-                <td style="padding: 14px 8px; font-weight: 800; color: var(--text-main);">本月合计支出</td>
+                <td style="padding: 14px 8px; font-weight: 800; color: var(--text-main);">本月统计支出（含摊销）</td>
                 <td style="padding: 14px 8px; text-align: right; color: var(--text-main); font-weight: 800; font-size: 18px;">${month_total:.2f}</td>
             </tr>
         """
@@ -347,7 +377,7 @@ async def render_dashboard(month: Optional[str] = None):
 
         <div class="chart-grid">
             <div class="card" style="display: flex; flex-direction: column;">
-                <div class="kpi-title">近 6 个月消费趋势</div>
+                <div class="kpi-title">近 6 个月统计趋势（含摊销）</div>
                 <div id="trendChart" class="chart-container"></div>
             </div>
             <div class="card" style="display: flex; flex-direction: column;">
@@ -368,7 +398,7 @@ async def render_dashboard(month: Optional[str] = None):
             </div>
             
             <div class="card">
-                <div class="kpi-title">{selected_month} 分类明细汇总表</div>
+                <div class="kpi-title">{selected_month} 分类汇总（含摊销）</div>
                 <table style="width: 100%; border-collapse: collapse; text-align: left; margin-top: 12px;">
                     <thead>
                         <tr style="border-bottom: 2px solid var(--border);">
@@ -527,6 +557,7 @@ async def dashboard_main():
                     <div class="form-group"><label>税费</label><input type="number" step="0.01" name="tax" inputmode="decimal" value="0.00"></div>
                 </div>
                 <div class="form-group"><label>总金额 (Total)</label><input type="number" step="0.01" name="amount" inputmode="decimal" required></div>
+                <div class="form-group"><label><input type="checkbox" name="annual_expense" value="true"> 年度支出（统计按 12 个月均摊）</label></div>
                 <button type="submit" class="btn-primary" style="background: var(--success); width: 100%;">快速确认保存</button>
             </form>
         </div>
@@ -597,7 +628,7 @@ async def history(sort: str = "date", order: str = "desc"):
     cursor = conn.cursor()
     cursor.execute(f"""
         SELECT id, filename, amount, merchant, date, raw_text, status,
-               subtotal, tax, category, created_at
+               subtotal, tax, category, created_at, COALESCE(amortization_months, 1)
         FROM records
         WHERE status = 'confirmed'
         ORDER BY {empty_dates_last}{sort_columns[sort]} {direction}, id DESC
@@ -679,6 +710,7 @@ async def history(sort: str = "date", order: str = "desc"):
             <span>📱 手机扫码或访问：<a href="http://{local_ip}:8000">http://{local_ip}:8000</a> (需在同一 Wi-Fi 下)</span>
         </div>
         <p class="history-help">点击表头排序；点击任意记录展开详情。</p>
+        <p><a class="btn-edit" href="/export.csv">导出 CSV</a></p>
         <div class="history-shell">
         <table class="history-table">
             <thead><tr>
@@ -702,6 +734,8 @@ async def history(sort: str = "date", order: str = "desc"):
         cat_code = escape(str(r[9] or "0"))
         amount_val = r[2] if r[2] else 0.0
         created_at_val = escape(str(r[10] or "未知"))
+        annual_checked = "checked" if int(r[11] or 1) == 12 else ""
+        annual_badge = " · 年摊" if annual_checked else ""
         
         display_cat = escape(cmap.get(cat_code, cat_code))
         cat_options = "".join([f"<option value='{escape(code)}' {'selected' if code==cat_code else ''}>{escape(name)} ({escape(code)})</option>" for code, name in cmap.items()])
@@ -711,7 +745,7 @@ async def history(sort: str = "date", order: str = "desc"):
                 f"<td class='merchant-cell' title='{merchant_val}'>{merchant_val or '未知商户'}</td>" \
                 f"<td class='date-cell'>{created_at_val}</td>" \
                 f"<td class='date-cell'>{date_val or '未知'}</td>" \
-                f"<td><span class='compact-badge' title='{display_cat}'>{display_cat}</span></td>" \
+                f"<td><span class='compact-badge' title='{display_cat}{annual_badge}'>{display_cat}{annual_badge}</span></td>" \
                 f"<td class='amount-cell'>${amount_val:.2f}</td></tr>" \
                 f"<tr class='detail-row' id='detail-{r[0]}'><td colspan='6'>" \
                 f"<div class='history-detail'>" \
@@ -729,6 +763,7 @@ async def history(sort: str = "date", order: str = "desc"):
                 f"<div class='form-group'><label>税费 (Tax)</label><input type='number' step='0.01' name='tax' value='{tax_val}'></div>" \
                 f"</div>" \
                 f"<div class='form-group'><label>总金额 (Total)</label><input type='number' step='0.01' name='amount' value='{amount_val}' required></div>" \
+                f"<div class='form-group'><label><input type='checkbox' name='annual_expense' value='true' {annual_checked}> 年度支出（统计按 12 个月均摊）</label></div>" \
                 f"<button type='submit' class='btn-edit'>保存修改</button></form>" \
                 f"<form action='/delete' method='post' onsubmit=\"return confirm('确定要删除这条历史记录吗？');\">" \
                 f"<input type='hidden' name='id' value='{r[0]}'>" \
@@ -766,6 +801,44 @@ async def history(sort: str = "date", order: str = "desc"):
             });
         </script>
     </div></body></html>"""
+
+@app.get("/export.csv")
+async def export_csv():
+    conn = sqlite3.connect('finance.db')
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT r.id, r.date, r.merchant, COALESCE(c.name, r.category),
+               r.subtotal, r.tax, r.amount, r.raw_text
+        FROM records r
+        LEFT JOIN categories c ON r.category = c.code
+        WHERE r.status = 'confirmed'
+        ORDER BY CASE WHEN r.date IS NULL OR r.date = '' THEN 1 ELSE 0 END ASC,
+                 r.date DESC, r.id DESC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(["external_id", "date", "merchant", "category", "subtotal", "tax", "amount", "raw_text"])
+    for row in rows:
+        writer.writerow([
+            f"spendmoney-{row[0]}",
+            format_export_date(row[1]),
+            row[2] or "",
+            row[3] or "",
+            format_export_amount(row[4]),
+            format_export_amount(row[5]),
+            format_export_amount(row[6]),
+            row[7] or "",
+        ])
+
+    filename = f"spendmoney-export-{datetime.date.today().isoformat()}.csv"
+    return Response(
+        content=output.getvalue().encode("utf-8-sig"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 @app.get("/categories", response_class=HTMLResponse)
 async def manage_categories():
@@ -1004,7 +1077,8 @@ async def manual_add(
     subtotal: float = Form(0.0),
     tax: float = Form(0.0),
     amount: float = Form(...),
-    category: str = Form("0")
+    category: str = Form("0"),
+    annual_expense: bool = Form(False)
 ):
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
@@ -1013,8 +1087,8 @@ async def manual_add(
     status = 'confirmed' 
     
     cursor.execute(
-        "INSERT INTO records (filename, amount, merchant, date, subtotal, tax, category, raw_text, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))",
-        (filename, amount, merchant, date, subtotal, tax, category, raw_text, status)
+        "INSERT INTO records (filename, amount, merchant, date, subtotal, tax, category, raw_text, status, created_at, amortization_months) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'), ?)",
+        (filename, amount, merchant, date, subtotal, tax, category, raw_text, status, 12 if annual_expense else 1)
     )
     conn.commit()
     conn.close()
@@ -1043,12 +1117,13 @@ async def update(
     subtotal: float = Form(0.0),
     tax: float = Form(0.0),
     category: str = Form("0"),
+    annual_expense: bool = Form(False),
     source: str = Form("/")
 ):
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
-    cursor.execute("UPDATE records SET amount=?, merchant=?, date=?, subtotal=?, tax=?, category=?, status='confirmed' WHERE id=?", 
-                   (amount, merchant, date, subtotal, tax, category, id))
+    cursor.execute("UPDATE records SET amount=?, merchant=?, date=?, subtotal=?, tax=?, category=?, amortization_months=?, status='confirmed' WHERE id=?",
+                   (amount, merchant, date, subtotal, tax, category, 12 if annual_expense else 1, id))
     conn.commit()
     conn.close()
     return f"""

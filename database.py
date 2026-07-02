@@ -35,6 +35,10 @@ def init_db():
         cursor.execute("ALTER TABLE records ADD COLUMN created_at TEXT")
     except sqlite3.OperationalError:
         pass
+    record_columns = {row[1] for row in cursor.execute("PRAGMA table_info(records)")}
+    if "amortization_months" not in record_columns:
+        cursor.execute("ALTER TABLE records ADD COLUMN amortization_months INTEGER DEFAULT 1")
+    cursor.execute("UPDATE records SET amortization_months = 1 WHERE amortization_months IS NULL OR amortization_months < 1")
         
     # 【修复核心】：使用 IF NOT EXISTS，如果 categories 表已经存在，绝对不砸表，完 good 保留你的自定义标签
     cursor.execute('''CREATE TABLE IF NOT EXISTS categories 
