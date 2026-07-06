@@ -14,7 +14,7 @@ from typing import Optional
 from fastapi import FastAPI, File, Form, UploadFile, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from database import init_db
+from database import DEFAULT_OWNER_USER_ID, init_db
 from processor import process_receipt_file, UPLOAD_DIR, PROCESSED_DIR
 from PIL import Image, ImageOps
 
@@ -23,6 +23,29 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 app = FastAPI()
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.mount("/processed", StaticFiles(directory=PROCESSED_DIR), name="processed")
+
+def spendmoney_return_url(source: str) -> str:
+    """Only allow post-action redirects back into SpendMoney."""
+    if source == "/spendmoney/" or source.startswith("/spendmoney/history?"):
+        return source
+    return "/spendmoney/"
+
+def get_owner_user_id(request: Request) -> str:
+    """Nginx injects this after Django auth_request succeeds."""
+    owner_user_id = (request.headers.get("X-Authenticated-User-Id") or "").strip()
+    return owner_user_id or DEFAULT_OWNER_USER_ID
+
+def get_api_key_owner(api_key: str):
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return None
+
+    conn = sqlite3.connect('finance.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT owner_user_id FROM api_keys WHERE api_key=? AND is_active=1", (api_key,))
+    row = cursor.fetchone()
+    conn.close()
+    return str(row[0]) if row else None
 
 def get_local_ip():
     try:
@@ -51,10 +74,21 @@ async def startup_event():
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     os.makedirs(PROCESSED_DIR, exist_ok=True)
 
-def get_category_map():
+def get_category_map(owner_user_id=DEFAULT_OWNER_USER_ID):
+    owner_user_id = str(owner_user_id)
+    defaults = [
+        ('1', '餐饮美食'), ('2', '服饰美容'),
+        ('3', '交通汽车'), ('4', '居家生活'),
+        ('5', '休闲娱乐'), ('6', '数码电器'),
+        ('7', '医疗健康'), ('0', '未分类/其他')
+    ]
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT code, name FROM categories ORDER BY cast(code as integer)")
+    cursor.execute("SELECT COUNT(*) FROM categories WHERE owner_user_id=?", (owner_user_id,))
+    if cursor.fetchone()[0] == 0:
+        cursor.executemany("INSERT INTO categories (owner_user_id, code, name) VALUES (?, ?, ?)", [(owner_user_id, code, name) for code, name in defaults])
+        conn.commit()
+    cursor.execute("SELECT code, name FROM categories WHERE owner_user_id=? ORDER BY cast(code as integer)", (owner_user_id,))
     cmap = {row[0]: row[1] for row in cursor.fetchall()}
     conn.close()
     return cmap
@@ -155,6 +189,33 @@ COMMON_HEAD = """
         .msg-page { display:flex; justify-content:center; align-items:center; height:100vh; margin:0; }
         .msg-card { text-align: center; max-width: 400px; width: 100%; padding: 40px 24px; margin: 24px;}
         .msg-title { margin-top: 0; font-size: 24px; color: var(--text-main); font-weight: 800;}
+
+        @media (max-width: 600px) {
+            body { overflow-x: hidden; }
+            .container { width: 100%; padding: 14px 12px 40px; box-sizing: border-box; }
+            h2 { margin-bottom: 14px; font-size: 23px; }
+            h3 { margin: 24px 0 14px; font-size: 17px; }
+            .card h3:first-child { margin-top: 0; }
+            .nav-bar { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; top: 6px; margin-bottom: 14px; padding: 6px; overflow: visible; }
+            .nav-bar a { display: flex; min-width: 0; min-height: 40px; align-items: center; justify-content: center; padding: 7px 5px; font-size: 12px; line-height: 1.25; text-align: center; white-space: normal; }
+            .nav-bar a:last-child { grid-column: 1 / -1; }
+            .ip-banner { display: block; margin-bottom: 14px; padding: 10px 12px; font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
+            .card { padding: 16px; margin-bottom: 12px; border-radius: 13px; }
+            .card:hover { transform: none; }
+            .form-row { display: block; }
+            .form-group { width: 100%; margin-bottom: 13px; }
+            input[type="text"], input[type="number"], input[type="date"], input[type="file"], select { min-height: 46px; padding: 11px 12px; font-size: 16px; }
+            input[type="file"] { padding: 9px; }
+            button, .btn-link { min-height: 44px; padding: 11px 14px; }
+            .row { gap: 8px; flex-wrap: wrap; }
+            .merchant { font-size: 18px; }
+            .amount { font-size: 21px; }
+            .ocr-details { max-height: 150px; overflow-wrap: anywhere; }
+            .kpi-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+            .kpi-grid .card { padding: 14px; }
+            .kpi-value { font-size: 25px; }
+            .chart-container { height: 260px; }
+        }
     </style>
     <script>
         function showLoading(msg) {
@@ -166,45 +227,46 @@ COMMON_HEAD = """
 """
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def render_dashboard(month: Optional[str] = None):
+async def render_dashboard(request: Request, month: Optional[str] = None):
+    owner_user_id = get_owner_user_id(request)
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
     
     # 核心总计指标
-    cursor.execute("SELECT COUNT(*) FROM records WHERE status != 'confirmed'")
+    cursor.execute("SELECT COUNT(*) FROM records WHERE owner_user_id=? AND status != 'confirmed'", (owner_user_id,))
     pending_count = cursor.fetchone()[0] or 0
     
-    cursor.execute("SELECT SUM(amount), SUM(tax), SUM(subtotal), COUNT(*) FROM records WHERE status = 'confirmed'")
+    cursor.execute("SELECT SUM(amount), SUM(tax), SUM(subtotal), COUNT(*) FROM records WHERE owner_user_id=? AND status = 'confirmed'", (owner_user_id,))
     row = cursor.fetchone()
     total_amount = row[0] if row[0] else 0.0
     total_tax = row[1] if row[1] else 0.0
     total_subtotal = row[2] if row[2] else 0.0
     confirmed_count = row[3] if row[3] else 0
     
-    # ==================== 【新增：计算近 7 天消费趋势所需数据】 ====================
+    # 计算近 15 天消费趋势所需数据
     now = datetime.datetime.now()
-    days_7 = []
-    for i in range(6, -1, -1):
+    days_15 = []
+    for i in range(14, -1, -1):
         d = now - datetime.timedelta(days=i)
-        days_7.append(d.strftime("%Y-%m-%d"))
+        days_15.append(d.strftime("%Y-%m-%d"))
         
-    cutoff_day = days_7[0]
+    cutoff_day = days_15[0]
     cursor.execute("""
         SELECT date, SUM(amount) 
         FROM records 
-        WHERE status = 'confirmed' AND date != '' AND date >= ?
+        WHERE owner_user_id=? AND status = 'confirmed' AND date != '' AND date >= ?
         GROUP BY date 
         ORDER BY date ASC
-    """, (cutoff_day,))
+    """, (owner_user_id, cutoff_day))
     
     day_trend_data = cursor.fetchall()
-    day_trend_dict = {d: 0.0 for d in days_7}
+    day_trend_dict = {d: 0.0 for d in days_15}
     for r in day_trend_data:
         d_str, amt = r[0], r[1]
         if d_str in day_trend_dict:
             day_trend_dict[d_str] = amt
             
-    amounts_7 = list(day_trend_dict.values())
+    amounts_15 = list(day_trend_dict.values())
     # ============================================================================
 
     # 1. 计算大图表所需的过去 6 个月时间轴
@@ -222,8 +284,8 @@ async def render_dashboard(month: Optional[str] = None):
     cursor.execute("""
         SELECT date, amount, COALESCE(amortization_months, 1)
         FROM records
-        WHERE status = 'confirmed' AND date != ''
-    """)
+        WHERE owner_user_id=? AND status = 'confirmed' AND date != ''
+    """, (owner_user_id,))
     confirmed_records = cursor.fetchall()
 
     def add_months(month_text, offset):
@@ -243,9 +305,9 @@ async def render_dashboard(month: Optional[str] = None):
     dates = list(trend_dict.keys())
     amounts = list(trend_dict.values())
     
-    # 2. 动态生成供下拉选择的过去 12 个月历史轴
+    # 2. 动态生成供下拉选择的最近 6 个月历史轴
     dropdown_months = []
-    for i in range(12):
+    for i in range(6):
         m = now.month - i
         y = now.year
         if m <= 0:
@@ -265,9 +327,9 @@ async def render_dashboard(month: Optional[str] = None):
         SELECT r.date, r.amount, COALESCE(r.amortization_months, 1),
                COALESCE(c.name, r.category)
         FROM records r
-        LEFT JOIN categories c ON r.category = c.code
-        WHERE r.status = 'confirmed' AND r.date != ''
-    """)
+        LEFT JOIN categories c ON r.owner_user_id = c.owner_user_id AND r.category = c.code
+        WHERE r.owner_user_id=? AND r.status = 'confirmed' AND r.date != ''
+    """, (owner_user_id,))
     category_totals = {}
     for record_date, record_amount, amortization_months, cat_name in cursor.fetchall():
         start_month = str(record_date)[:7]
@@ -302,14 +364,14 @@ async def render_dashboard(month: Optional[str] = None):
         """
 
     # AI 引擎性能数据
-    cursor.execute("SELECT COUNT(*) FROM records WHERE status = 'ocr_failed'")
+    cursor.execute("SELECT COUNT(*) FROM records WHERE owner_user_id=? AND status = 'ocr_failed'", (owner_user_id,))
     failed_count = cursor.fetchone()[0] or 0
     total_processed = confirmed_count + pending_count
     success_rate = 100.0
     if total_processed + failed_count > 0:
         success_rate = (total_processed / (total_processed + failed_count)) * 100
         
-    cursor.execute("SELECT COUNT(*) FROM records WHERE status = 'confirmed' AND (date = '' OR merchant = 'Unknown')")
+    cursor.execute("SELECT COUNT(*) FROM records WHERE owner_user_id=? AND status = 'confirmed' AND (date = '' OR merchant = 'Unknown')", (owner_user_id,))
     incomplete_count = cursor.fetchone()[0] or 0
     completeness_rate = 100.0
     if confirmed_count > 0:
@@ -319,7 +381,6 @@ async def render_dashboard(month: Optional[str] = None):
     tax_ratio = (total_tax / total_subtotal * 100) if total_subtotal > 0 else 0.0
     
     conn.close()
-    local_ip = get_local_ip()
 
     html = f"""
     <!doctype html>
@@ -344,16 +405,17 @@ async def render_dashboard(month: Optional[str] = None):
     </head>
     <body>
     <div class="container">
-        <h2>SpendMoney 控制台</h2>
+        <h2>记账中心</h2>
         <div class="nav-bar">
             <a href="/spendmoney/dashboard" class="active">📊 数据看板</a>
             <a href="/spendmoney/">🧾 上传与待办</a>
             <a href="/spendmoney/history">🗄️ 历史台账</a>
             <a href="/spendmoney/categories">🏷️ 标签管理</a>
+            <a href="/nav/">🏠 返回主页</a>
         </div>
         
         <div class="ip-banner">
-            <span>📱 手机扫码或访问：<a href="http://{local_ip}:8000">http://{local_ip}:8000</a> (需在同一 Wi-Fi 下)</span>
+            <span>📲 快捷指令 POST 接口：<code>/spendmoney/api/iphone-upload</code></span>
         </div>
 
         <div class="kpi-grid">
@@ -381,7 +443,7 @@ async def render_dashboard(month: Optional[str] = None):
                 <div id="trendChart" class="chart-container"></div>
             </div>
             <div class="card" style="display: flex; flex-direction: column;">
-                <div class="kpi-title">近 7 天消费趋势</div>
+                <div class="kpi-title">近 15 天消费趋势</div>
                 <div id="dayTrendChart" class="chart-container"></div>
             </div>
         </div>
@@ -421,43 +483,43 @@ async def render_dashboard(month: Optional[str] = None):
 
         // 近 6 个月消费趋势配置
         var trendOption = {{
-            tooltip: {{ trigger: 'axis' }},
+            tooltip: {{ trigger: 'axis', formatter: function(params) {{ var item = params[0]; return item.marker + '月度消费: $' + Number(item.value).toFixed(2); }} }},
             grid: {{ left: '3%', right: '4%', bottom: '3%', containLabel: true }},
-            xAxis: {{ type: 'category', boundaryGap: false, data: {json.dumps(dates)} }},
+            xAxis: {{ type: 'category', data: {json.dumps(dates)} }},
             yAxis: {{ type: 'value' }},
             series: [{{
-                name: '月度消费',
-                type: 'line',
-                smooth: true,
-                areaStyle: {{ color: 'rgba(15, 23, 42, 0.1)' }},
-                lineStyle: {{ color: '#0f172a', width: 3 }},
-                itemStyle: {{ color: '#0f172a' }},
+                name: '月度消费', type: 'bar', barMaxWidth: 42,
+                itemStyle: {{ color: '#334155', borderRadius: [5, 5, 0, 0] }},
+                data: {json.dumps(amounts)}
+            }}, {{
+                name: '趋势线', type: 'line', symbol: 'none', smooth: true,
+                lineStyle: {{ color: '#64748b', width: 2, type: 'dashed' }},
                 data: {json.dumps(amounts)}
             }}]
         }};
         trendChart.setOption(trendOption);
 
-        // 近 7 天消费趋势配置
+        // 近 15 天消费趋势配置
         var dayTrendOption = {{
-            tooltip: {{ trigger: 'axis' }},
-            grid: {{ left: '3%', right: '4%', bottom: '3%', containLabel: true }},
-            xAxis: {{ type: 'category', boundaryGap: false, data: {json.dumps(days_7)} }},
+            tooltip: {{ trigger: 'axis', formatter: function(params) {{ var item = params[0]; return item.marker + '日度消费: $' + Number(item.value).toFixed(2); }} }},
+            grid: {{ left: '3%', right: '4%', bottom: '8%', containLabel: true }},
+            xAxis: {{ type: 'category', data: {json.dumps(days_15)}, axisLabel: {{ formatter: function(value) {{ return value.slice(5); }}, rotate: 35 }} }},
             yAxis: {{ type: 'value' }},
             series: [{{
-                name: '日度消费',
-                type: 'line',
-                smooth: true,
-                areaStyle: {{ color: 'rgba(16, 185, 129, 0.1)' }},
-                lineStyle: {{ color: '#10b981', width: 3 }},
-                itemStyle: {{ color: '#10b981' }},
-                data: {json.dumps(amounts_7)}
+                name: '日度消费', type: 'bar', barMaxWidth: 28,
+                itemStyle: {{ color: '#10b981', borderRadius: [4, 4, 0, 0] }},
+                data: {json.dumps(amounts_15)}
+            }}, {{
+                name: '趋势线', type: 'line', symbol: 'none', smooth: true,
+                lineStyle: {{ color: '#047857', width: 2, type: 'dashed' }},
+                data: {json.dumps(amounts_15)}
             }}]
         }};
         dayTrendChart.setOption(dayTrendOption);
 
         // 分类饼图配置
         var categoryOption = {{
-            tooltip: {{ trigger: 'item', formatter: '{{b}}: ${{c}} ({{d}}%)' }},
+            tooltip: {{ trigger: 'item', formatter: function(item) {{ return item.marker + item.name + ': $' + Number(item.value).toFixed(2) + ' (' + Number(item.percent).toFixed(2) + '%)'; }} }},
             legend: {{ orient: 'horizontal', bottom: 'bottom' }},
             series: [{{
                 name: '分类',
@@ -493,16 +555,16 @@ async def render_dashboard(month: Optional[str] = None):
     return html
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard_main():
-    cmap = get_category_map()
+async def dashboard_main(request: Request):
+    owner_user_id = get_owner_user_id(request)
+    cmap = get_category_map(owner_user_id)
     
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT id, filename, amount, merchant, date, raw_text, status, subtotal, tax, category FROM records WHERE status != 'confirmed'")
+    cursor.execute("SELECT id, filename, amount, merchant, date, raw_text, status, subtotal, tax, category FROM records WHERE owner_user_id=? AND status != 'confirmed'", (owner_user_id,))
     records = cursor.fetchall()
     conn.close()
     
-    local_ip = get_local_ip()
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
 
     html = f"""
@@ -518,16 +580,17 @@ async def dashboard_main():
         <div id="loading-text" style="font-weight:bold; font-size: 16px; color:var(--text-main);">正在处理上传...</div>
     </div>
     <div class="container">
-        <h2>SpendMoney 控制台</h2>
+        <h2>记账中心</h2>
         <div class="nav-bar">
             <a href="/spendmoney/dashboard">📊 数据看板</a>
             <a href="/spendmoney/" class="active">🧾 上传与待办</a>
             <a href="/spendmoney/history">🗄️ 历史台账</a>
             <a href="/spendmoney/categories">🏷️ 标签管理</a>
+            <a href="/nav/">🏠 返回主页</a>
         </div>
         
         <div class="ip-banner">
-            <span>📱 手机扫码或访问：<a href="http://{local_ip}:8000">http://{local_ip}:8000</a> (需在同一 Wi-Fi 下)</span>
+            <span>📲 快捷指令 POST 接口：<code>/spendmoney/api/iphone-upload</code></span>
         </div>
         
         <div class="card" style="padding-bottom: 16px;">
@@ -582,7 +645,7 @@ async def dashboard_main():
                 f"<div class='ocr-details' style='margin-bottom:16px;'>{raw_text}</div>" \
                 f"<form action='/spendmoney/update' method='post'>" \
                 f"<input type='hidden' name='id' value='{r[0]}'>" \
-                f"<input type='hidden' name='source' value='/'>" \
+                f"<input type='hidden' name='source' value='/spendmoney/'>" \
                 f"<div class='form-row'>" \
                 f"<div class='form-group'><label>商户名称</label><input type='text' name='merchant' value='{merchant_val}' required></div>" \
                 f"<div class='form-group'><label>确认分类标签</label><select name='category'>{cat_options}</select></div>" \
@@ -596,7 +659,7 @@ async def dashboard_main():
                 f"<button type='submit' class='btn-edit'>确认无误并入库</button></form>" \
                 f"<form action='/spendmoney/delete' method='post' onsubmit=\"return confirm('确定要彻底删除这条记录吗？');\">" \
                 f"<input type='hidden' name='id' value='{r[0]}'>" \
-                f"<input type='hidden' name='source' value='/'>" \
+                f"<input type='hidden' name='source' value='/spendmoney/'>" \
                 f"<button type='submit' class='btn-danger'>删除此草稿</button></form></div>"
 
     if not records:
@@ -605,15 +668,16 @@ async def dashboard_main():
     return html + "</div></body></html>"
 
 @app.get("/history", response_class=HTMLResponse)
-async def history(sort: str = "date", order: str = "desc"):
-    cmap = get_category_map()
+async def history(request: Request, sort: str = "date", order: str = "desc"):
+    owner_user_id = get_owner_user_id(request)
+    cmap = get_category_map(owner_user_id)
 
     sort_columns = {
         "id": "id",
         "merchant": "merchant COLLATE NOCASE",
         "created_at": "created_at",
         "date": "date",
-        "category": "(SELECT name FROM categories WHERE code = records.category) COLLATE NOCASE",
+        "category": "(SELECT name FROM categories WHERE owner_user_id = records.owner_user_id AND code = records.category) COLLATE NOCASE",
         "amount": "amount",
     }
     if sort not in sort_columns:
@@ -630,13 +694,12 @@ async def history(sort: str = "date", order: str = "desc"):
         SELECT id, filename, amount, merchant, date, raw_text, status,
                subtotal, tax, category, created_at, COALESCE(amortization_months, 1)
         FROM records
-        WHERE status = 'confirmed'
+        WHERE owner_user_id=? AND status = 'confirmed'
         ORDER BY {empty_dates_last}{sort_columns[sort]} {direction}, id DESC
-    """)
+    """, (owner_user_id,))
     records = cursor.fetchall()
     conn.close()
 
-    local_ip = get_local_ip()
     source_url = f"/spendmoney/history?sort={quote(sort)}&order={quote(order)}"
 
     def sort_link(column, label):
@@ -644,7 +707,7 @@ async def history(sort: str = "date", order: str = "desc"):
         indicator = ""
         if column == sort:
             indicator = " ↑" if order == "asc" else " ↓"
-        return f"<a href='/history?sort={column}&order={next_order}'>{label}{indicator}</a>"
+        return f"<a href='/spendmoney/history?sort={column}&order={next_order}'>{label}{indicator}</a>"
 
     html = f"""
     <!doctype html>
@@ -698,16 +761,17 @@ async def history(sort: str = "date", order: str = "desc"):
     </head>
     <body>
     <div class="container">
-        <h2>SpendMoney 控制台</h2>
+        <h2>记账中心</h2>
         <div class="nav-bar">
             <a href="/spendmoney/dashboard">📊 数据看板</a>
             <a href="/spendmoney/">🧾 上传与待办</a>
             <a href="/spendmoney/history" class="active">🗄️ 历史台账</a>
             <a href="/spendmoney/categories">🏷️ 标签管理</a>
+            <a href="/nav/">🏠 返回主页</a>
         </div>
         
         <div class="ip-banner">
-            <span>📱 手机扫码或访问：<a href="http://{local_ip}:8000">http://{local_ip}:8000</a> (需在同一 Wi-Fi 下)</span>
+            <span>📲 快捷指令 POST 接口：<code>/spendmoney/api/iphone-upload</code></span>
         </div>
         <p class="history-help">点击表头排序；点击任意记录展开详情。</p>
         <p><a class="btn-edit" href="/spendmoney/export.csv">导出 CSV</a></p>
@@ -803,18 +867,19 @@ async def history(sort: str = "date", order: str = "desc"):
     </div></body></html>"""
 
 @app.get("/export.csv")
-async def export_csv():
+async def export_csv(request: Request):
+    owner_user_id = get_owner_user_id(request)
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
     cursor.execute("""
         SELECT r.id, r.date, r.merchant, COALESCE(c.name, r.category),
                r.subtotal, r.tax, r.amount, r.raw_text
         FROM records r
-        LEFT JOIN categories c ON r.category = c.code
-        WHERE r.status = 'confirmed'
+        LEFT JOIN categories c ON r.owner_user_id = c.owner_user_id AND r.category = c.code
+        WHERE r.owner_user_id=? AND r.status = 'confirmed'
         ORDER BY CASE WHEN r.date IS NULL OR r.date = '' THEN 1 ELSE 0 END ASC,
                  r.date DESC, r.id DESC
-    """)
+    """, (owner_user_id,))
     rows = cursor.fetchall()
     conn.close()
 
@@ -841,8 +906,9 @@ async def export_csv():
     )
 
 @app.get("/categories", response_class=HTMLResponse)
-async def manage_categories():
-    cmap = get_category_map()
+async def manage_categories(request: Request):
+    owner_user_id = get_owner_user_id(request)
+    cmap = get_category_map(owner_user_id)
     
     html = f"""
     <!doctype html>
@@ -853,12 +919,13 @@ async def manage_categories():
     </head>
     <body>
     <div class="container">
-        <h2>SpendMoney 控制台</h2>
+        <h2>记账中心</h2>
         <div class="nav-bar">
             <a href="/spendmoney/dashboard">📊 数据看板</a>
             <a href="/spendmoney/">🧾 上传与待办</a>
             <a href="/spendmoney/history">🗄️ 历史台账</a>
             <a href="/spendmoney/categories" class="active">🏷️ 标签管理</a>
+            <a href="/nav/">🏠 返回主页</a>
         </div>
         
         <div class="card" style="background: var(--primary); color: #fff; border:none;">
@@ -902,11 +969,12 @@ async def manage_categories():
     return html + "</div></body></html>"
 
 @app.post("/category_add", response_class=HTMLResponse)
-async def category_add(code: str = Form(...), name: str = Form(...)):
+async def category_add(request: Request, code: str = Form(...), name: str = Form(...)):
+    owner_user_id = get_owner_user_id(request)
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO categories (code, name) VALUES (?, ?)", (code.strip(), name.strip()))
+        cursor.execute("INSERT INTO categories (owner_user_id, code, name) VALUES (?, ?, ?)", (owner_user_id, code.strip(), name.strip()))
         conn.commit()
     except sqlite3.IntegrityError:
         pass 
@@ -914,25 +982,27 @@ async def category_add(code: str = Form(...), name: str = Form(...)):
     return f"""<script>window.location.href='/spendmoney/categories';</script>"""
 
 @app.post("/category_update", response_class=HTMLResponse)
-async def category_update(code: str = Form(...), name: str = Form(...)):
+async def category_update(request: Request, code: str = Form(...), name: str = Form(...)):
+    owner_user_id = get_owner_user_id(request)
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
-    cursor.execute("UPDATE categories SET name=? WHERE code=?", (name.strip(), code))
+    cursor.execute("UPDATE categories SET name=? WHERE owner_user_id=? AND code=?", (name.strip(), owner_user_id, code))
     conn.commit()
     conn.close()
     return f"""<script>window.location.href='/spendmoney/categories';</script>"""
 
 @app.post("/category_delete", response_class=HTMLResponse)
-async def category_delete(code: str = Form(...)):
+async def category_delete(request: Request, code: str = Form(...)):
+    owner_user_id = get_owner_user_id(request)
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM categories WHERE code=?", (code,))
+    cursor.execute("DELETE FROM categories WHERE owner_user_id=? AND code=?", (owner_user_id, code))
     conn.commit()
     conn.close()
     return f"""<script>window.location.href='/spendmoney/categories';</script>"""
 
 @app.post("/upload", response_class=HTMLResponse)
-async def upload_receipt(file: UploadFile = File(...)):
+async def upload_receipt(request: Request, file: UploadFile = File(...)):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     original_name = os.path.basename(file.filename or "receipt.jpg")
     safe_name = f"{uuid.uuid4().hex}_{original_name}"
@@ -1025,6 +1095,7 @@ async def cancel_upload(filename: str = Form(...)):
 
 @app.post("/confirm", response_class=HTMLResponse)
 async def confirm_receipt(
+    request: Request,
     filename: str = Form(...), 
     crop_x: int = Form(0), 
     crop_y: int = Form(0), 
@@ -1034,9 +1105,10 @@ async def confirm_receipt(
     file_path = os.path.join(UPLOAD_DIR, os.path.basename(filename))
 
     if not os.path.exists(file_path):
-        return "File not found. <a href='/'>Return</a>"
+        return "File not found. <a href='/spendmoney/'>Return</a>"
 
-    result = await asyncio.to_thread(process_receipt_file, file_path, os.path.basename(filename), crop_x, crop_y, crop_w, crop_h)
+    owner_user_id = get_owner_user_id(request)
+    result = await asyncio.to_thread(process_receipt_file, file_path, os.path.basename(filename), crop_x, crop_y, crop_w, crop_h, owner_user_id)
     status = escape(result.get("status", "unknown"))
 
     if status == "ocr_failed":
@@ -1049,7 +1121,7 @@ async def confirm_receipt(
                 <div class="msg-icon">⚠️</div>
                 <h2 class="msg-title" style="color: var(--danger);">提取失败</h2>
                 <p class="hint">OCR 引擎发生错误，请检查后台日志。</p>
-                <a href='/' class="btn-link btn-cancel">返回首页</a>
+                <a href='/spendmoney/' class="btn-link btn-cancel">返回记账主页</a>
             </div>
         </body>
         </html>
@@ -1072,6 +1144,7 @@ async def confirm_receipt(
 
 @app.post("/manual_add", response_class=HTMLResponse)
 async def manual_add(
+    request: Request,
     merchant: str = Form(...),
     date: str = Form(""),
     subtotal: float = Form(0.0),
@@ -1080,6 +1153,7 @@ async def manual_add(
     category: str = Form("0"),
     annual_expense: bool = Form(False)
 ):
+    owner_user_id = get_owner_user_id(request)
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
     filename = f"manual_{uuid.uuid4().hex}"
@@ -1087,8 +1161,8 @@ async def manual_add(
     status = 'confirmed' 
     
     cursor.execute(
-        "INSERT INTO records (filename, amount, merchant, date, subtotal, tax, category, raw_text, status, created_at, amortization_months) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'), ?)",
-        (filename, amount, merchant, date, subtotal, tax, category, raw_text, status, 12 if annual_expense else 1)
+        "INSERT INTO records (owner_user_id, filename, amount, merchant, date, subtotal, tax, category, raw_text, status, created_at, amortization_months) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'), ?)",
+        (owner_user_id, filename, amount, merchant, date, subtotal, tax, category, raw_text, status, 12 if annual_expense else 1)
     )
     conn.commit()
     conn.close()
@@ -1110,6 +1184,7 @@ async def manual_add(
 
 @app.post("/update", response_class=HTMLResponse)
 async def update(
+    request: Request,
     id: int = Form(...), 
     amount: float = Form(...), 
     merchant: str = Form(...), 
@@ -1118,12 +1193,13 @@ async def update(
     tax: float = Form(0.0),
     category: str = Form("0"),
     annual_expense: bool = Form(False),
-    source: str = Form("/")
+    source: str = Form("/spendmoney/")
 ):
+    owner_user_id = get_owner_user_id(request)
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
-    cursor.execute("UPDATE records SET amount=?, merchant=?, date=?, subtotal=?, tax=?, category=?, amortization_months=?, status='confirmed' WHERE id=?",
-                   (amount, merchant, date, subtotal, tax, category, 12 if annual_expense else 1, id))
+    cursor.execute("UPDATE records SET amount=?, merchant=?, date=?, subtotal=?, tax=?, category=?, amortization_months=?, status='confirmed' WHERE id=? AND owner_user_id=?",
+                   (amount, merchant, date, subtotal, tax, category, 12 if annual_expense else 1, id, owner_user_id))
     conn.commit()
     conn.close()
     return f"""
@@ -1136,16 +1212,17 @@ async def update(
                 <h2 class="msg-title" style="color: var(--success);">保存成功</h2>
                 <p class="hint">数据已安全更新并归档。</p>
             </div>
-            <script>setTimeout(function(){{ window.location.href='{escape(source)}'; }}, 800);</script>
+            <script>setTimeout(function(){{ window.location.href='{escape(spendmoney_return_url(source))}'; }}, 800);</script>
         </body>
         </html>
     """
 
 @app.post("/delete", response_class=HTMLResponse)
-async def delete_record(id: int = Form(...), source: str = Form("/")):
+async def delete_record(request: Request, id: int = Form(...), source: str = Form("/spendmoney/")):
+    owner_user_id = get_owner_user_id(request)
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM records WHERE id=?", (id,))
+    cursor.execute("DELETE FROM records WHERE id=? AND owner_user_id=?", (id, owner_user_id))
     conn.commit()
     conn.close()
     return f"""
@@ -1158,7 +1235,7 @@ async def delete_record(id: int = Form(...), source: str = Form("/")):
                 <h2 class="msg-title">记录已彻底删除</h2>
                 <p class="hint">正在返回上级页面...</p>
             </div>
-            <script>setTimeout(function(){{ window.location.href='{escape(source)}'; }}, 800);</script>
+            <script>setTimeout(function(){{ window.location.href='{escape(spendmoney_return_url(source))}'; }}, 800);</script>
         </body>
         </html>
     """
@@ -1166,8 +1243,8 @@ async def delete_record(id: int = Form(...), source: str = Form("/")):
 @app.post("/api/iphone-upload")
 async def receive_iphone_receipt(request: Request):
     api_key = request.headers.get("X-API-Key", "")
-    expected_key = os.environ.get("SPENDMONEY_API_KEY", "")
-    if not expected_key or api_key != expected_key:
+    owner_user_id = get_api_key_owner(api_key)
+    if not owner_user_id:
         return JSONResponse(status_code=401, content={
             "status": "error",
             "message": "Unauthorized"
@@ -1226,10 +1303,10 @@ async def receive_iphone_receipt(request: Request):
         cursor.execute(
             """
             INSERT INTO records 
-            (filename, amount, merchant, date, subtotal, tax, category, raw_text, status, created_at) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
+            (owner_user_id, filename, amount, merchant, date, subtotal, tax, category, raw_text, status, created_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
             """,
-            (virtual_filename, total, merchant, date_str, subtotal, tax, category_code, raw_text_for_db, status)
+            (owner_user_id, virtual_filename, total, merchant, date_str, subtotal, tax, category_code, raw_text_for_db, status)
         )
         record_id = cursor.lastrowid
         conn.commit()

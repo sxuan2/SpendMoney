@@ -4,7 +4,7 @@ from PIL import Image
 os.environ["OMP_NUM_THREADS"] = "1"
 
 import shutil
-from database import record_exists, insert_record
+from database import DEFAULT_OWNER_USER_ID, record_exists, insert_record
 from paddleocr import PaddleOCR
 
 UPLOAD_DIR = 'uploaded_receipts'
@@ -111,13 +111,13 @@ def parse_receipt_data(raw_text):
 
     return merchant, amount, date, subtotal, tax
 
-def process_receipt_file(file_path, filename=None, crop_x=0, crop_y=0, crop_w=0, crop_h=0):
+def process_receipt_file(file_path, filename=None, crop_x=0, crop_y=0, crop_w=0, crop_h=0, owner_user_id=DEFAULT_OWNER_USER_ID):
     filename = filename or os.path.basename(file_path)
 
     if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
         return {"ok": False, "status": "unsupported_file", "raw_text": "", "filename": filename}
 
-    if record_exists(filename):
+    if record_exists(filename, owner_user_id):
         shutil.move(file_path, os.path.join(PROCESSED_DIR, filename))
         return {"ok": True, "status": "duplicate", "raw_text": "", "filename": filename}
 
@@ -156,12 +156,12 @@ def process_receipt_file(file_path, filename=None, crop_x=0, crop_y=0, crop_w=0,
         print(f"[DEBUG] 提取结果 -> 默认代码:{category}, 商户:{merchant}, 总额:{amount}")
         print(f"[DEBUG] === 处理结束 ===\n")
 
-        insert_record(filename, amount, merchant, date, subtotal, tax, category, raw_text, status="processed")
+        insert_record(filename, amount, merchant, date, subtotal, tax, category, raw_text, status="processed", owner_user_id=owner_user_id)
         shutil.move(file_path, os.path.join(PROCESSED_DIR, filename))
         return {"ok": True, "status": "processed", "raw_text": raw_text, "filename": filename}
     except Exception as exc:
         error_text = f"OCR_ERROR: {exc}"
-        insert_record(filename, 0.0, "Unknown", "", 0.0, 0.0, "0", error_text, status="ocr_failed")
+        insert_record(filename, 0.0, "Unknown", "", 0.0, 0.0, "0", error_text, status="ocr_failed", owner_user_id=owner_user_id)
         print(f"[!] OCR failed for {filename}: {exc}")
 
         shutil.move(file_path, os.path.join(PROCESSED_DIR, filename))
