@@ -14,6 +14,7 @@ from typing import Optional
 from fastapi import FastAPI, File, Form, UploadFile, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from dashboard_stats import build_dashboard_stats
 from database import DEFAULT_OWNER_USER_ID, init_db
 from processor import process_receipt_file, UPLOAD_DIR, PROCESSED_DIR
 from PIL import Image, ImageOps
@@ -113,6 +114,33 @@ def ensure_owner_default_categories(cursor, owner_user_id):
     )
 
 
+def normalize_amortization_months(value, record_type="expense"):
+    if normalize_record_type(record_type) == "income":
+        return 1
+    try:
+        months = int(value or 1)
+    except (TypeError, ValueError):
+        months = 1
+    return max(1, min(months, 120))
+
+
+def validation_error_page(title: str, message: str, back_url: str = "/spendmoney/") -> str:
+    return f"""
+        <!doctype html>
+        <html lang="zh-CN">
+        <head><title>{escape(title)}</title>{COMMON_HEAD}</head>
+        <body class="msg-page">
+            <div class="card msg-card">
+                <div class="msg-icon">!</div>
+                <h2 class="msg-title" style="color: var(--danger);">{escape(title)}</h2>
+                <p class="hint">{escape(message)}</p>
+                <a class="btn-link btn-primary" href="{escape(back_url)}">返回修改</a>
+            </div>
+        </body>
+        </html>
+    """
+
+
 def get_category_rows(owner_user_id=DEFAULT_OWNER_USER_ID, category_type=None):
     owner_user_id = str(owner_user_id)
     category_type = normalize_category_type(category_type) if category_type else None
@@ -200,6 +228,7 @@ COMMON_HEAD = """
         .form-row { display: flex; gap: 12px; }
         .form-group { margin-bottom: 16px; flex: 1; }
         .form-group label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+        .amortization-field.is-hidden { display: none; }
         input[type="text"], input[type="number"], input[type="date"], input[type="file"], select {{ width: 100%; box-sizing: border-box; padding: 12px 16px; border-radius: 10px; border: 1px solid var(--border); font-size: 15px; font-family: inherit; background: var(--bg-color); transition: all 0.2s; font-weight: 600; color: var(--text-main); }}
         input[readonly] { background: #f3f4f6; color: #9ca3af; cursor: not-allowed; }
         input:focus:not([readonly]), select:focus { outline: none; border-color: var(--primary); background: #fff; box-shadow: 0 0 0 3px rgba(15, 23, 42, 0.1); }
@@ -277,158 +306,156 @@ COMMON_HEAD = """
 @app.get("/dashboard", response_class=HTMLResponse)
 async def render_dashboard(request: Request, month: Optional[str] = None):
     owner_user_id = get_owner_user_id(request)
-    conn = sqlite3.connect('finance.db')
-    cursor = conn.cursor()
-    
-    # 核心总计指标
-    cursor.execute("SELECT COUNT(*) FROM records WHERE owner_user_id=? AND status != 'confirmed'", (owner_user_id,))
-    pending_count = cursor.fetchone()[0] or 0
-    
-    cursor.execute("SELECT SUM(amount), SUM(tax), SUM(subtotal), COUNT(*) FROM records WHERE owner_user_id=? AND status = 'confirmed'", (owner_user_id,))
-    row = cursor.fetchone()
-    total_amount = row[0] if row[0] else 0.0
-    total_tax = row[1] if row[1] else 0.0
-    total_subtotal = row[2] if row[2] else 0.0
-    confirmed_count = row[3] if row[3] else 0
-    
-    # 计算近 15 天消费趋势所需数据
-    now = datetime.datetime.now()
-    days_15 = []
-    for i in range(14, -1, -1):
-        d = now - datetime.timedelta(days=i)
-        days_15.append(d.strftime("%Y-%m-%d"))
-        
-    cutoff_day = days_15[0]
-    cursor.execute("""
-        SELECT date, SUM(amount) 
-        FROM records 
-        WHERE owner_user_id=? AND status = 'confirmed' AND date != '' AND date >= ?
-        GROUP BY date 
-        ORDER BY date ASC
-    """, (owner_user_id, cutoff_day))
-    
-    day_trend_data = cursor.fetchall()
-    day_trend_dict = {d: 0.0 for d in days_15}
-    for r in day_trend_data:
-        d_str, amt = r[0], r[1]
-        if d_str in day_trend_dict:
-            day_trend_dict[d_str] = amt
-            
-    amounts_15 = list(day_trend_dict.values())
-    # ============================================================================
+    stats = build_dashboard_stats(owner_user_id, month)
+    selected_month = stats.selected_month
 
-    # 1. 计算大图表所需的过去 6 个月时间轴
-    last_6_months = []
-    for i in range(5, -1, -1):
-        m = now.month - i
-        y = now.year
-        if m <= 0:
-            m += 12
-            y -= 1
-        last_6_months.append(f"{y:04d}-{m:02d}")
-    
-    cutoff_month = last_6_months[0]
-    trend_dict = {m: 0.0 for m in last_6_months}
-    cursor.execute("""
-        SELECT date, amount, COALESCE(amortization_months, 1)
-        FROM records
-        WHERE owner_user_id=? AND status = 'confirmed' AND date != ''
-    """, (owner_user_id,))
-    confirmed_records = cursor.fetchall()
-
-    def add_months(month_text, offset):
-        year, month_number = map(int, month_text.split("-"))
-        absolute_month = year * 12 + month_number - 1 + offset
-        return f"{absolute_month // 12:04d}-{absolute_month % 12 + 1:02d}"
-
-    for record_date, record_amount, amortization_months in confirmed_records:
-        start_month = str(record_date)[:7]
-        months = max(1, int(amortization_months or 1))
-        monthly_amount = (record_amount or 0.0) / months
-        for offset in range(months):
-            target_month = add_months(start_month, offset)
-            if target_month in trend_dict:
-                trend_dict[target_month] += monthly_amount
-            
-    dates = list(trend_dict.keys())
-    amounts = list(trend_dict.values())
-    
-    # 2. 动态生成供下拉选择的最近 6 个月历史轴
-    dropdown_months = []
-    for i in range(6):
-        m = now.month - i
-        y = now.year
-        if m <= 0:
-            m += 12
-            y -= 1
-        dropdown_months.append(f"{y:04d}-{m:02d}")
-        
-    selected_month = month if month else now.strftime("%Y-%m")
-    
     month_options = ""
-    for dm in dropdown_months:
+    for dm in stats.dropdown_months:
         sel = "selected" if dm == selected_month else ""
         month_options += f"<option value='{dm}' {sel}>{dm}</option>"
-    
-    # 3. 抓取选定月份的聚合分类数据
-    cursor.execute("""
-        SELECT r.date, r.amount, COALESCE(r.amortization_months, 1),
-               COALESCE(c.name, r.category)
-        FROM records r
-        LEFT JOIN categories c ON r.owner_user_id = c.owner_user_id AND r.category = c.code
-        WHERE r.owner_user_id=? AND r.status = 'confirmed' AND r.date != ''
-    """, (owner_user_id,))
-    category_totals = {}
-    for record_date, record_amount, amortization_months, cat_name in cursor.fetchall():
-        start_month = str(record_date)[:7]
-        months = max(1, int(amortization_months or 1))
-        covered_months = (add_months(start_month, offset) for offset in range(months))
-        if selected_month in covered_months:
-            category_totals[cat_name] = category_totals.get(cat_name, 0.0) + (record_amount or 0.0) / months
-    month_category_data = sorted(category_totals.items(), key=lambda item: item[1], reverse=True)
-    category_pie = [{"name": r[0] if r[0] else "未知代码", "value": r[1]} for r in month_category_data]
-    
-    # 4. 组装月度分类汇总表 HTML
-    table_rows = ""
-    month_total = 0.0
-    for r in month_category_data:
-        cat_name = escape(r[0] if r[0] else "未知代码")
-        amt = r[1]
-        month_total += amt
-        table_rows += f"""
-            <tr style="border-bottom: 1px solid #f3f4f6;">
-                <td style="padding: 12px 8px; font-weight: 600; color: var(--text-main);">{cat_name}</td>
-                <td style="padding: 12px 8px; text-align: right; color: var(--success); font-weight: bold;">${amt:.2f}</td>
-            </tr>
-        """
-    if not month_category_data:
-        table_rows = "<tr><td colspan='2' style='padding: 24px; text-align: center; color: var(--text-muted); font-weight: 600;'>该月份暂无任何入库账单</td></tr>"
-    else:
-        table_rows += f"""
-            <tr style="background: #fafafa;">
-                <td style="padding: 14px 8px; font-weight: 800; color: var(--text-main);">本月统计支出（含摊销）</td>
-                <td style="padding: 14px 8px; text-align: right; color: var(--text-main); font-weight: 800; font-size: 18px;">${month_total:.2f}</td>
-            </tr>
+
+    savings_rate = (stats.selected_month_net / stats.selected_month_income * 100) if stats.selected_month_income else 0.0
+    kpi_net_class = "amount-net-positive" if stats.selected_month_net >= 0 else "amount-net-negative"
+    budget_gap = stats.budget_remaining
+    budget_gap_class = "amount-net-positive" if budget_gap >= 0 else "amount-net-negative"
+    budget_label = "预算内剩余" if budget_gap >= 0 else "预算内超出"
+    projected_gap_class = "amount-net-positive" if stats.projected_budget_gap >= 0 else "amount-net-negative"
+    projected_gap_label = "预计剩余" if stats.projected_budget_gap >= 0 else "预计超出"
+    daily_budget_class = "amount-net-positive" if stats.daily_budget_remaining >= 0 else "amount-net-negative"
+    monthly_average = round(stats.avg_monthly_expense, 2)
+    avg_expense_amounts = [monthly_average for _ in stats.dates]
+
+    def build_expense_rank_items(rows):
+        if not rows:
+            return "<div class='rank-empty'>暂无支出</div>"
+        total = sum(amount for _, amount in rows) or 0.0
+        max_amount = max(amount for _, amount in rows) or 1.0
+        items_html = ""
+        for name, amount in rows:
+            width = max(4, min(100, amount / max_amount * 100))
+            percent = (amount / total * 100) if total else 0.0
+            safe_name = escape(name if name else "未知代码")
+            items_html += f"""
+                <div class="rank-row">
+                    <div class="rank-name" title="{safe_name}">{safe_name}</div>
+                    <div class="rank-meta amount-expense">${amount:.2f} / {percent:.0f}%</div>
+                    <div class="rank-track"><div class="rank-fill expense" style="width: {width:.1f}%;"></div></div>
+                </div>
+            """
+        return f"<div class='rank-list'>{items_html}</div>"
+
+    def build_budget_analysis():
+        if stats.total_budget <= 0:
+            return """
+                <div class='budget-analysis-grid'>
+                    <div class='budget-analysis-item budget-analysis-wide'>
+                        <div class='budget-analysis-label'>预算状态</div>
+                        <div class='budget-analysis-value'>未设置</div>
+                        <div class='budget-analysis-note'>去标签管理为主要支出标签设置月预算后，这里会显示预计月底是否超支。</div>
+                    </div>
+                </div>
+            """
+        return f"""
+            <div class="budget-analysis-grid">
+                <div class="budget-analysis-item">
+                    <div class="budget-analysis-label">预算内已用</div>
+                    <div class="budget-analysis-value">{stats.budget_used_percent:.0f}%</div>
+                    <div class="budget-analysis-note">${stats.budgeted_expense:.2f} / ${stats.total_budget:.2f}</div>
+                </div>
+                <div class="budget-analysis-item">
+                    <div class="budget-analysis-label">{projected_gap_label}</div>
+                    <div class="budget-analysis-value {projected_gap_class}">${abs(stats.projected_budget_gap):.2f}</div>
+                    <div class="budget-analysis-note">预计预算内支出 ${stats.projected_budgeted_expense:.2f}</div>
+                </div>
+                <div class="budget-analysis-item">
+                    <div class="budget-analysis-label">剩余日均可花</div>
+                    <div class="budget-analysis-value {daily_budget_class}">${stats.daily_budget_remaining:.2f}</div>
+                    <div class="budget-analysis-note">剩余 {stats.month_days_remaining} 天</div>
+                </div>
+                <div class="budget-analysis-item">
+                    <div class="budget-analysis-label">非预算支出</div>
+                    <div class="budget-analysis-value">${stats.unbudgeted_expense:.2f}</div>
+                    <div class="budget-analysis-note">一次性/未设预算，不计入预算已用</div>
+                </div>
+            </div>
         """
 
-    # AI 引擎性能数据
-    cursor.execute("SELECT COUNT(*) FROM records WHERE owner_user_id=? AND status = 'ocr_failed'", (owner_user_id,))
-    failed_count = cursor.fetchone()[0] or 0
-    total_processed = confirmed_count + pending_count
-    success_rate = 100.0
-    if total_processed + failed_count > 0:
-        success_rate = (total_processed / (total_processed + failed_count)) * 100
-        
-    cursor.execute("SELECT COUNT(*) FROM records WHERE owner_user_id=? AND status = 'confirmed' AND (date = '' OR merchant = 'Unknown')", (owner_user_id,))
-    incomplete_count = cursor.fetchone()[0] or 0
-    completeness_rate = 100.0
-    if confirmed_count > 0:
-        completeness_rate = ((confirmed_count - incomplete_count) / confirmed_count) * 100
-        
-    aov = (total_amount / confirmed_count) if confirmed_count > 0 else 0.0
-    tax_ratio = (total_tax / total_subtotal * 100) if total_subtotal > 0 else 0.0
-    
-    conn.close()
+    def build_budget_items(statuses, suggestions):
+        if statuses:
+            items_html = ""
+            for item in statuses:
+                safe_name = escape(item.name)
+                if item.state == "unset":
+                    meta = f"已用 ${item.amount:.2f} · 未设预算"
+                    state_class = "budget-unset"
+                    width = 0
+                elif item.state == "over":
+                    meta = f"超出 ${abs(item.remaining):.2f}"
+                    state_class = "budget-over"
+                    width = 100
+                else:
+                    meta = f"已用 {item.percent:.0f}% · 剩余 ${item.remaining:.2f}"
+                    state_class = "budget-warning" if item.state == "warning" else "budget-ok"
+                    width = max(3, min(100, item.percent))
+                items_html += f"""
+                    <div class="budget-row">
+                        <div class="budget-head">
+                            <span class="budget-name" title="{safe_name}">{safe_name}</span>
+                            <span class="budget-meta {state_class}">{meta}</span>
+                        </div>
+                        <div class="budget-track"><div class="budget-fill {state_class}" style="width: {width:.1f}%;"></div></div>
+                    </div>
+                """
+            return f"<div class='budget-list'>{items_html}</div>"
+        if suggestions:
+            suggestion_items = "".join(f"<li>{escape(name)}</li>" for name in suggestions)
+            return f"<div class='empty-panel'><div>建议先给这些高频支出设月预算：</div><ul>{suggestion_items}</ul></div>"
+        return "<div class='empty-panel'>暂无支出数据，暂不需要设置预算。</div>"
+
+    def build_task_items():
+        tasks = []
+        if stats.pending_count:
+            tasks.append(("待复核账单", f"{stats.pending_count} 笔", "/spendmoney/"))
+        if stats.uncategorized_count:
+            tasks.append(("未分类支出", f"{stats.uncategorized_count} 笔", f"/spendmoney/history?month={selected_month}"))
+        if stats.amortized_item_count:
+            tasks.append(("年度摊销中", f"{stats.amortized_item_count} 项", f"/spendmoney/history?amortized=1&record_type=expense"))
+        over_count = sum(1 for item in stats.budget_statuses if item.state == "over")
+        if over_count:
+            tasks.append(("预算超支标签", f"{over_count} 个", "/spendmoney/categories"))
+        if not tasks:
+            return "<div class='empty-panel'>本月没有需要优先处理的事项。</div>"
+        rows = ""
+        for title, value, href in tasks:
+            rows += f"""
+                <a class="task-row" href="{href}">
+                    <span>{escape(title)}</span>
+                    <strong>{escape(value)}</strong>
+                </a>
+            """
+        return f"<div class='task-list'>{rows}</div>"
+
+    def build_recent_rows(items):
+        if not items:
+            return "<tr><td colspan='4' class='empty-cell'>本月暂无确认支出</td></tr>"
+        rows = ""
+        for item in items:
+            badge = "<span class='mini-badge'>摊销</span>" if item.is_amortized else ""
+            rows += f"""
+                <tr>
+                    <td>{escape(item.date[5:] if len(item.date) >= 10 else item.date)}</td>
+                    <td title="{escape(item.merchant)}">{escape(item.merchant)} {badge}</td>
+                    <td title="{escape(item.category)}">{escape(item.category)}</td>
+                    <td class="amount-expense" style="text-align:right; font-weight:800; white-space:nowrap;">${item.amount:.2f}</td>
+                </tr>
+            """
+        return rows
+
+    expense_rank_items = build_expense_rank_items(stats.expense_category_data)
+    budget_analysis = build_budget_analysis()
+    budget_items = build_budget_items(stats.budget_statuses, stats.budget_suggestions)
+    task_items = build_task_items()
+    recent_rows = build_recent_rows(stats.recent_expenses)
 
     html = f"""
     <!doctype html>
@@ -438,17 +465,58 @@ async def render_dashboard(request: Request, month: Optional[str] = None):
         <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
         {COMMON_HEAD}
         <style>
-            .chart-container {{
-                width: 100% !important;
-                min-width: 100% !important;
-                height: 320px;
-            }}
-            .chart-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-                gap: 16px;
-                width: 100%;
-            }}
+            .workbench-filter {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:16px; }}
+            .workbench-note {{ color:#64748b; font-size:13px; font-weight:800; }}
+            .chart-container {{ width:100% !important; min-width:100% !important; height:320px; }}
+            .control-grid {{ display:grid; grid-template-columns:minmax(0, 1.45fr) minmax(300px, .85fr); gap:16px; }}
+            .analysis-grid {{ display:grid; grid-template-columns:minmax(0, 1fr) minmax(300px, 1fr); gap:16px; }}
+            .amount-income {{ color:#059669; }}
+            .amount-expense {{ color:#dc2626; }}
+            .amount-net-positive {{ color:#047857; }}
+            .amount-net-negative {{ color:#b91c1c; }}
+            .split-list {{ display:flex; flex-direction:column; gap:12px; margin-top:18px; }}
+            .split-row {{ display:flex; align-items:center; justify-content:space-between; padding:14px; border:1px solid #eef2f7; background:#f8fafc; border-radius:8px; }}
+            .split-label {{ color:#64748b; font-size:13px; font-weight:800; }}
+            .split-value {{ color:#111827; font-size:20px; font-weight:900; }}
+            .rank-list {{ display:flex; flex-direction:column; gap:13px; margin-top:14px; }}
+            .rank-row {{ display:grid; grid-template-columns:minmax(92px, 1fr) auto; gap:10px 12px; align-items:baseline; }}
+            .rank-name {{ color:#111827; font-size:14px; font-weight:900; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+            .rank-meta {{ font-size:13px; font-weight:900; white-space:nowrap; }}
+            .rank-track, .budget-track {{ grid-column:1 / -1; height:9px; border-radius:999px; background:#eef2f7; overflow:hidden; }}
+            .rank-fill, .budget-fill {{ height:100%; min-width:5px; border-radius:inherit; }}
+            .rank-fill.expense {{ background:#ef4444; }}
+            .budget-analysis-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:14px; }}
+            .budget-analysis-item {{ padding:13px; border:1px solid #eef2f7; background:#f8fafc; border-radius:8px; }}
+            .budget-analysis-wide {{ grid-column:1 / -1; }}
+            .budget-analysis-label {{ color:#64748b; font-size:12px; font-weight:900; margin-bottom:7px; }}
+            .budget-analysis-value {{ color:#111827; font-size:20px; font-weight:900; line-height:1.15; }}
+            .budget-analysis-note {{ color:#64748b; font-size:12px; font-weight:800; margin-top:7px; line-height:1.4; }}
+            .budget-list {{ display:flex; flex-direction:column; gap:14px; margin-top:16px; padding-top:16px; border-top:1px solid #eef2f7; }}
+            .budget-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px; }}
+            .budget-name {{ color:#111827; font-size:14px; font-weight:900; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+            .budget-meta {{ font-size:13px; font-weight:900; white-space:nowrap; }}
+            .budget-fill.budget-ok {{ background:#10b981; }}
+            .budget-fill.budget-warning {{ background:#f59e0b; }}
+            .budget-fill.budget-over {{ background:#ef4444; }}
+            .budget-ok {{ color:#047857; }}
+            .budget-warning {{ color:#b45309; }}
+            .budget-over {{ color:#dc2626; }}
+            .budget-unset {{ color:#64748b; }}
+            .empty-panel {{ padding:18px; background:#f8fafc; border:1px solid #eef2f7; border-radius:8px; color:#64748b; font-weight:800; line-height:1.6; }}
+            .empty-panel ul {{ margin:8px 0 0 18px; padding:0; }}
+            .task-list {{ display:flex; flex-direction:column; gap:10px; margin-top:14px; }}
+            .task-row {{ display:flex; justify-content:space-between; align-items:center; padding:13px 14px; border:1px solid #eef2f7; border-radius:8px; color:#111827; text-decoration:none; font-weight:900; background:#f8fafc; }}
+            .task-row strong {{ color:#2563eb; }}
+            .data-table {{ width:100%; border-collapse:collapse; table-layout:fixed; margin-top:12px; }}
+            .data-table th {{ text-align:left; color:#64748b; font-size:12px; padding:9px 8px; border-bottom:2px solid var(--border); }}
+            .data-table td {{ padding:9px 8px; border-bottom:1px solid #f1f5f9; font-size:13px; line-height:1.35; font-weight:600; color:#111827; vertical-align:middle; }}
+            .data-table th:nth-child(1), .data-table td:nth-child(1) {{ width:48px; }}
+            .data-table th:nth-child(3), .data-table td:nth-child(3) {{ width:94px; }}
+            .data-table th:nth-child(4), .data-table td:nth-child(4) {{ width:82px; }}
+            .data-table td:nth-child(2), .data-table td:nth-child(3) {{ font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+            .empty-cell {{ text-align:center; color:#64748b !important; padding:24px 8px !important; }}
+            .mini-badge {{ display:inline-flex; margin-left:5px; padding:1px 5px; border-radius:999px; background:#e0f2fe; color:#0369a1; font-size:10px; font-weight:800; }}
+            @media (max-width: 880px) {{ .control-grid, .analysis-grid {{ grid-template-columns:1fr; }} .workbench-filter {{ align-items:flex-start; flex-direction:column; }} }}
         </style>
     </head>
     <body>
@@ -461,141 +529,96 @@ async def render_dashboard(request: Request, month: Optional[str] = None):
             <a href="/spendmoney/categories">🏷️ 标签管理</a>
             <a href="/nav/">🏠 返回主页</a>
         </div>
-        
-        <div class="ip-banner">
-            <span>📲 快捷指令 POST 接口：<code>/spendmoney/api/iphone-upload</code></span>
+
+        <div class="workbench-filter">
+            <div class="workbench-note">支出控制工作台 · 支出口径含年度摊销</div>
+            <select id="monthSelector" onchange="location.href='/spendmoney/dashboard?month=' + this.value" style="width:auto; padding:7px 12px; font-size:14px; margin:0; border-radius:8px;">
+                {month_options}
+            </select>
         </div>
 
         <div class="kpi-grid">
             <div class="card">
-                <div class="kpi-title">总消费金额</div>
-                <div class="kpi-value green">${total_amount:.2f}</div>
+                <div class="kpi-title">本月支出（含摊销）</div>
+                <div class="kpi-value amount-expense">${stats.selected_month_expense:.2f}</div>
             </div>
             <div class="card">
-                <div class="kpi-title">累计贡献税费</div>
-                <div class="kpi-value">${total_tax:.2f}</div>
+                <div class="kpi-title">本月收入</div>
+                <div class="kpi-value green">${stats.selected_month_income:.2f}</div>
             </div>
             <div class="card">
-                <div class="kpi-title">待办复核任务</div>
-                <div class="kpi-value blue">{pending_count}</div>
+                <div class="kpi-title">本月结余</div>
+                <div class="kpi-value {kpi_net_class}">${stats.selected_month_net:.2f}</div>
+                <div class="workbench-note">结余率 {savings_rate:.0f}%</div>
             </div>
             <div class="card">
-                <div class="kpi-title">已入库总数</div>
-                <div class="kpi-value">{confirmed_count}</div>
+                <div class="kpi-title">待处理</div>
+                <div class="kpi-value blue">{stats.pending_count + stats.uncategorized_count}</div>
             </div>
         </div>
 
-        <div class="chart-grid">
-            <div class="card" style="display: flex; flex-direction: column;">
-                <div class="kpi-title">近 6 个月统计趋势（含摊销）</div>
-                <div id="trendChart" class="chart-container"></div>
+        <div class="control-grid">
+            <div class="card" style="display:flex; flex-direction:column;">
+                <div class="kpi-title">近 6 个月支出趋势</div>
+                <div id="expenseTrendChart" class="chart-container"></div>
             </div>
-            <div class="card" style="display: flex; flex-direction: column;">
-                <div class="kpi-title">近 15 天消费趋势</div>
-                <div id="dayTrendChart" class="chart-container"></div>
-            </div>
-        </div>
-
-        <div class="chart-grid">
-            <div class="card" style="display: flex; flex-direction: column;">
-                <div class="row" style="align-items: center; margin-bottom: 0;">
-                    <div class="kpi-title" style="margin: 0;">筛选账期</div>
-                    <select id="monthSelector" onchange="location.href='/spendmoney/dashboard?month=' + this.value" style="width: auto; padding: 6px 12px; font-size: 14px; margin: 0; border-radius: 8px;">
-                        {month_options}
-                    </select>
+            <div class="card">
+                <div class="kpi-title">{selected_month} 支出拆解</div>
+                <div class="split-list">
+                    <div class="split-row"><span class="split-label">实际账单支出</span><span class="split-value amount-expense">${stats.selected_direct_expense:.2f}</span></div>
+                    <div class="split-row"><span class="split-label">年度摊销支出</span><span class="split-value amount-expense">${stats.selected_amortized_expense:.2f}</span></div>
+                    <div class="split-row"><span class="split-label">预算总额</span><span class="split-value">${stats.total_budget:.2f}</span></div>
+                    <div class="split-row"><span class="split-label">{budget_label}</span><span class="split-value {budget_gap_class}">${abs(budget_gap):.2f}</span></div>
+                    <div class="split-row"><span class="split-label">非预算支出</span><span class="split-value">${stats.unbudgeted_expense:.2f}</span></div>
                 </div>
-                <div id="categoryChart" class="chart-container"></div>
             </div>
-            
+        </div>
+
+        <div class="analysis-grid">
             <div class="card">
-                <div class="kpi-title">{selected_month} 分类汇总（含摊销）</div>
-                <table style="width: 100%; border-collapse: collapse; text-align: left; margin-top: 12px;">
-                    <thead>
-                        <tr style="border-bottom: 2px solid var(--border);">
-                            <th style="padding: 12px 8px; color: var(--text-muted); font-size: 14px; font-weight: 600;">标签名称</th>
-                            <th style="padding: 12px 8px; color: var(--text-muted); font-size: 14px; font-weight: 600; text-align: right;">当月汇总金额</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {table_rows}
-                    </tbody>
+                <div class="kpi-title">支出分类排行</div>
+                {expense_rank_items}
+            </div>
+            <div class="card">
+                <div class="kpi-title">预算分析</div>
+                {budget_analysis}
+                {budget_items}
+            </div>
+        </div>
+
+        <div class="analysis-grid">
+            <div class="card">
+                <div class="kpi-title">需要处理</div>
+                {task_items}
+            </div>
+            <div class="card">
+                <div class="kpi-title">最近支出明细</div>
+                <table class="data-table">
+                    <thead><tr><th>日期</th><th>商户</th><th>标签</th><th style="text-align:right;">金额</th></tr></thead>
+                    <tbody>{recent_rows}</tbody>
                 </table>
             </div>
         </div>
     </div>
 
     <script>
-        var trendChart = echarts.init(document.getElementById('trendChart'));
-        var dayTrendChart = echarts.init(document.getElementById('dayTrendChart'));
-        var categoryChart = echarts.init(document.getElementById('categoryChart'));
-
-        // 近 6 个月消费趋势配置
-        var trendOption = {{
-            tooltip: {{ trigger: 'axis', formatter: function(params) {{ var item = params[0]; return item.marker + '月度消费: $' + Number(item.value).toFixed(2); }} }},
-            grid: {{ left: '3%', right: '4%', bottom: '3%', containLabel: true }},
-            xAxis: {{ type: 'category', data: {json.dumps(dates)} }},
-            yAxis: {{ type: 'value' }},
-            series: [{{
-                name: '月度消费', type: 'bar', barMaxWidth: 42,
-                itemStyle: {{ color: '#334155', borderRadius: [5, 5, 0, 0] }},
-                data: {json.dumps(amounts)}
-            }}, {{
-                name: '趋势线', type: 'line', symbol: 'none', smooth: true,
-                lineStyle: {{ color: '#64748b', width: 2, type: 'dashed' }},
-                data: {json.dumps(amounts)}
-            }}]
-        }};
-        trendChart.setOption(trendOption);
-
-        // 近 15 天消费趋势配置
-        var dayTrendOption = {{
-            tooltip: {{ trigger: 'axis', formatter: function(params) {{ var item = params[0]; return item.marker + '日度消费: $' + Number(item.value).toFixed(2); }} }},
-            grid: {{ left: '3%', right: '4%', bottom: '8%', containLabel: true }},
-            xAxis: {{ type: 'category', data: {json.dumps(days_15)}, axisLabel: {{ formatter: function(value) {{ return value.slice(5); }}, rotate: 35 }} }},
-            yAxis: {{ type: 'value' }},
-            series: [{{
-                name: '日度消费', type: 'bar', barMaxWidth: 28,
-                itemStyle: {{ color: '#10b981', borderRadius: [4, 4, 0, 0] }},
-                data: {json.dumps(amounts_15)}
-            }}, {{
-                name: '趋势线', type: 'line', symbol: 'none', smooth: true,
-                lineStyle: {{ color: '#047857', width: 2, type: 'dashed' }},
-                data: {json.dumps(amounts_15)}
-            }}]
-        }};
-        dayTrendChart.setOption(dayTrendOption);
-
-        // 分类饼图配置
-        var categoryOption = {{
-            tooltip: {{ trigger: 'item', formatter: function(item) {{ return item.marker + item.name + ': $' + Number(item.value).toFixed(2) + ' (' + Number(item.percent).toFixed(2) + '%)'; }} }},
-            legend: {{ orient: 'horizontal', bottom: 'bottom' }},
-            series: [{{
-                name: '分类',
-                type: 'pie',
-                radius: ['45%', '75%'],
-                avoidLabelOverlap: false,
-                itemStyle: {{ borderRadius: 10, borderColor: '#fff', borderWidth: 2 }},
-                label: {{ show: false, position: 'center' }},
-                emphasis: {{ label: {{ show: true, fontSize: 16, fontWeight: 'bold' }} }},
-                labelLine: {{ show: false }},
-                data: {json.dumps(category_pie)}
-            }}]
-        }};
-        categoryChart.setOption(categoryOption);
-        
-        // 终极修复：使用多个时间步长连续强刷重绘，确保容器彻底在浏览器定型后将图表完全撑开
-        function forceResize() {{
-            trendChart.resize();
-            dayTrendChart.resize();
-            categoryChart.resize();
-        }}
-        
-        // 页面初始化及加载后全量刷新
+        var expenseTrendChart = echarts.init(document.getElementById('expenseTrendChart'));
+        var formatMoney = function(value) {{ return '$' + Number(value || 0).toFixed(2); }};
+        expenseTrendChart.setOption({{
+            tooltip: {{ trigger: 'axis', formatter: function(params) {{ return params.map(function(item) {{ return item.marker + item.seriesName + ': ' + formatMoney(item.value); }}).join('<br>'); }} }},
+            legend: {{ data: ['支出', '近 6 月均线'], top: 0, right: 0 }},
+            grid: {{ left: '3%', right: '4%', top: 46, bottom: '8%', containLabel: true }},
+            xAxis: {{ type: 'category', data: {json.dumps(stats.dates)}, axisTick: {{ alignWithLabel: true }} }},
+            yAxis: {{ type: 'value', axisLabel: {{ formatter: function(value) {{ return '$' + Number(value || 0).toLocaleString(); }} }}, splitLine: {{ lineStyle: {{ color: '#e5e7eb' }} }} }},
+            series: [
+                {{ name: '支出', type: 'bar', barMaxWidth: 34, itemStyle: {{ color: '#ef4444', borderRadius: [4, 4, 0, 0] }}, data: {json.dumps(stats.expense_amounts)} }},
+                {{ name: '近 6 月均线', type: 'line', symbol: 'none', lineStyle: {{ color: '#64748b', width: 2, type: 'dashed' }}, data: {json.dumps(avg_expense_amounts)} }}
+            ]
+        }});
+        function forceResize() {{ expenseTrendChart.resize(); }}
         forceResize();
         setTimeout(forceResize, 50);
         setTimeout(forceResize, 200);
-        
-        // 监听窗口大小改变
         window.addEventListener('resize', forceResize);
     </script>
     </body></html>
@@ -608,8 +631,8 @@ async def dashboard_main(request: Request):
     expense_rows = get_category_rows(owner_user_id, "expense")
     income_rows = get_category_rows(owner_user_id, "income")
     cmap = {code: name for code, name, _ in expense_rows}
-    expense_options = "".join([f"<option value='{escape(code)}' {'selected' if code=='0' else ''}>{escape(name)}</option>" for code, name, _ in expense_rows])
-    income_options = "".join([f"<option value='{escape(code)}'>{escape(name)}</option>" for code, name, _ in income_rows])
+    expense_options = "<option value='' selected disabled>请选择支出标签</option>" + "".join([f"<option value='{escape(code)}'>{escape(name)}</option>" for code, name, _ in expense_rows])
+    income_options = "<option value='' selected disabled>请选择收入标签</option>" + "".join([f"<option value='{escape(code)}'>{escape(name)}</option>" for code, name, _ in income_rows])
     category_options_by_type = json.dumps({
         "expense": [{"code": code, "name": name} for code, name, _ in expense_rows],
         "income": [{"code": code, "name": name} for code, name, _ in income_rows],
@@ -617,7 +640,7 @@ async def dashboard_main(request: Request):
     
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT id, filename, amount, merchant, date, raw_text, status, subtotal, tax, category, COALESCE(record_type, 'expense') FROM records WHERE owner_user_id=? AND status != 'confirmed'", (owner_user_id,))
+    cursor.execute("SELECT id, filename, amount, merchant, date, raw_text, status, subtotal, tax, category, COALESCE(record_type, 'expense'), COALESCE(amortization_months, 1) FROM records WHERE owner_user_id=? AND status != 'confirmed'", (owner_user_id,))
     records = cursor.fetchall()
     conn.close()
     
@@ -666,7 +689,7 @@ async def dashboard_main(request: Request):
                     <div class="form-group"><label>记录类型</label><select id="manualRecordType" name="record_type"><option value="expense">支出</option><option value="income">收入</option></select></div>
                     <div class="form-group"><label>商户/来源</label><input type="text" name="merchant" required></div>
                     <div class="form-group"><label>分类标签</label>
-                        <select id="manualCategory" name="category">
+                        <select id="manualCategory" name="category" required>
                             {expense_options}
                         </select>
                     </div>
@@ -677,7 +700,7 @@ async def dashboard_main(request: Request):
                     <div class="form-group"><label>税费</label><input type="number" min="0" step="0.01" name="tax" inputmode="decimal" value="0.00"></div>
                 </div>
                 <div class="form-group"><label>总金额 (Total)</label><input type="number" min="0" step="0.01" name="amount" inputmode="decimal" required></div>
-                <div class="form-group"><label><input type="checkbox" name="annual_expense" value="true"> 年度支出（统计按 12 个月均摊）</label></div>
+                <div class="form-group amortization-field"><label>摊销月数</label><input type="number" min="1" max="120" step="1" name="amortization_months" inputmode="numeric" value="1"><div class="hint">普通消费填 1；两月一交填 2；年费填 12。</div></div>
                 <button type="submit" class="btn-primary" style="background: var(--success); width: 100%;">快速确认保存</button>
             </form>
         </div>
@@ -691,12 +714,14 @@ async def dashboard_main(request: Request):
         raw_text = escape(str(r[5] or ""))
         subtotal_val = format_export_amount(r[7])
         tax_val = format_export_amount(r[8])
-        cat_code = escape(str(r[9] or "0"))
+        cat_code = escape(str(r[9] or ""))
         amount_val = format_export_amount(r[2])
         current_record_type = normalize_record_type(r[10] if len(r) > 10 else "expense")
         record_type_options = "".join([f"<option value='{escape(type_code)}' {'selected' if type_code==current_record_type else ''}>{escape(type_label)}</option>" for type_code, type_label in RECORD_TYPE_LABELS.items()])
+        amortization_months_val = normalize_amortization_months(r[11] if len(r) > 11 else 1, current_record_type)
         
-        cat_options = "".join([f"<option value='{escape(code)}' {'selected' if code==cat_code else ''}>{escape(name)} (代码: {escape(code)})</option>" for code, name in cmap.items()])
+        cat_placeholder_selected = "selected" if not cat_code or cat_code not in cmap else ""
+        cat_options = f"<option value='' disabled {cat_placeholder_selected}>请选择标签</option>" + "".join([f"<option value='{escape(code)}' {'selected' if code==cat_code else ''}>{escape(name)} (代码: {escape(code)})</option>" for code, name in cmap.items()])
         
         html += f"<div class='card'>" \
                 f"<div class='filename'>源文件: {escape(str(r[1]))}</div>" \
@@ -708,7 +733,7 @@ async def dashboard_main(request: Request):
                 f"<div class='form-row'>" \
                 f"<div class='form-group'><label>记录类型</label><select name='record_type' class='record-type-edit'>{record_type_options}</select></div>" \
                 f"<div class='form-group'><label>商户/来源</label><input type='text' name='merchant' value='{merchant_val}' required></div>" \
-                f"<div class='form-group'><label>确认分类标签</label><select name='category'>{cat_options}</select></div>" \
+                f"<div class='form-group'><label>确认分类标签</label><select name='category' required>{cat_options}</select></div>" \
                 f"</div>" \
                 f"<div class='form-group'><label>交易日期</label><input type='date' name='date' value='{date_val}'></div>" \
                 f"<div class='form-row'>" \
@@ -716,6 +741,7 @@ async def dashboard_main(request: Request):
                 f"<div class='form-group'><label>税费 (Tax)</label><input type='number' min='0' step='0.01' name='tax' inputmode='decimal' value='{tax_val}'></div>" \
                 f"</div>" \
                 f"<div class='form-group'><label>总金额 (Total)</label><input type='number' min='0' step='0.01' name='amount' inputmode='decimal' value='{amount_val}' required></div>" \
+                f"<div class='form-group amortization-field'><label>摊销月数</label><input type='number' min='1' max='120' step='1' name='amortization_months' inputmode='numeric' value='{amortization_months_val}'><div class='hint'>普通消费填 1；两月一交填 2；年费填 12。</div></div>" \
                 f"<button type='submit' class='btn-edit'>确认无误并入库</button></form>" \
                 f"<form action='/spendmoney/delete' method='post' onsubmit=\"return confirm('确定要彻底删除这条记录吗？');\">" \
                 f"<input type='hidden' name='id' value='{r[0]}'>" \
@@ -730,15 +756,33 @@ async def dashboard_main(request: Request):
         const manualCategoryOptions = {category_options_by_type};
         const manualRecordType = document.getElementById('manualRecordType');
         const manualCategory = document.getElementById('manualCategory');
+        function syncAmortizationField(form, typeSelect) {{
+            const field = form.querySelector('.amortization-field');
+            if (!field || !typeSelect) return;
+            const input = field.querySelector('input[name="amortization_months"]');
+            const isIncome = typeSelect.value === 'income';
+            field.classList.toggle('is-hidden', isIncome);
+            if (input) {{
+                input.disabled = isIncome;
+                if (isIncome) input.value = '1';
+            }}
+        }}
         function refreshManualCategories() {{
             const items = manualCategoryOptions[manualRecordType.value] || [];
-            manualCategory.innerHTML = items.map(function(item) {{
+            const label = manualRecordType.value === 'income' ? '请选择收入标签' : '请选择支出标签';
+            manualCategory.innerHTML = `<option value="" selected disabled>${{label}}</option>` + items.map(function(item) {{
                 return `<option value="${{item.code}}">${{item.name}}</option>`;
             }}).join('');
+            syncAmortizationField(manualRecordType.form, manualRecordType);
         }}
         if (manualRecordType && manualCategory) {{
             manualRecordType.addEventListener('change', refreshManualCategories);
+            syncAmortizationField(manualRecordType.form, manualRecordType);
         }}
+        document.querySelectorAll('.record-type-edit').forEach(function(typeSelect) {{
+            syncAmortizationField(typeSelect.form, typeSelect);
+            typeSelect.addEventListener('change', function() {{ syncAmortizationField(typeSelect.form, typeSelect); }});
+        }});
     </script>
     </div></body></html>"""
 
@@ -751,6 +795,7 @@ async def history(
     end_date: str = "",
     record_type: str = "",
     category: list[str] = Query(default=[]),
+    amortized: str = "",
 ):
     owner_user_id = get_owner_user_id(request)
     category_rows = get_category_rows(owner_user_id)
@@ -760,6 +805,7 @@ async def history(
     start_date = (start_date or "").strip()[:10]
     end_date = (end_date or "").strip()[:10]
     record_type = normalize_record_type(record_type) if record_type else ""
+    amortized = "1" if str(amortized).strip() in ("1", "true", "yes") else ""
     selected_categories = []
     for code in category:
         code = (code or "").strip()
@@ -798,6 +844,8 @@ async def history(
         placeholders = ", ".join(["?"] * len(selected_categories))
         where_clauses.append(f"category IN ({placeholders})")
         query_params.extend(selected_categories)
+    if amortized:
+        where_clauses.append("COALESCE(amortization_months, 1) > 1")
     where_sql = " AND ".join(where_clauses)
 
     conn = sqlite3.connect('finance.db')
@@ -813,7 +861,7 @@ async def history(
     records = cursor.fetchall()
     conn.close()
 
-    active_filters = {"start_date": start_date, "end_date": end_date, "record_type": record_type}
+    active_filters = {"start_date": start_date, "end_date": end_date, "record_type": record_type, "amortized": amortized}
     active_filters = {key: value for key, value in active_filters.items() if value}
     if selected_categories:
         active_filters["category"] = selected_categories
@@ -842,6 +890,7 @@ async def history(
         for code, name, category_type in category_rows
     ])
     clear_filter_url = history_url({"sort": sort, "order": order})
+    amortized_checked = "checked" if amortized else ""
     filtered_count = len(records)
     date_range_value = " 至 ".join([value for value in (start_date, end_date) if value])
 
@@ -888,8 +937,8 @@ async def history(
             .history-detail .form-group {{ margin-bottom: 10px; }}
             .history-detail input, .history-detail select {{ padding: 9px 11px; font-size: 13px; }}
             .history-help {{ margin: 0 0 10px; font-size: 12px; color: var(--text-muted); }}
-            .filter-card {{ padding: 20px 24px 18px; margin-bottom: 12px; }}
-            .filter-form {{ display: grid; grid-template-columns: 260px 150px 340px; column-gap: 22px; row-gap: 16px; align-items: end; }}
+            .filter-card {{ padding: 18px 24px 16px; margin-bottom: 12px; }}
+            .filter-form {{ display: grid; grid-template-columns: minmax(220px, 1.1fr) minmax(130px, .55fr) minmax(260px, 1.35fr); column-gap: 22px; row-gap: 14px; align-items: end; }}
             .filter-form > * {{ min-width: 0; }}
             .filter-form .form-group {{ margin-bottom: 0; min-width: 0; }}
             .filter-form label {{ margin-bottom: 7px; font-size: 13px; font-weight: 800; color: var(--text-muted); }}
@@ -921,11 +970,15 @@ async def history(
             .record-type-income {{ background:#dcfce7; color:#166534; }}
             .export-form {{ margin: 0; }}
             .export-form button {{ width: auto; min-width: 108px; margin-bottom: 0; }}
+            .filter-meta {{ display:flex; align-items:center; gap:18px; min-width:0; }}
+            .checkbox-filter {{ min-height: 40px; display:inline-flex; align-items:center; gap:8px; color:var(--text-main); font-size:13px; font-weight:800; white-space:nowrap; }}
+            .checkbox-filter input {{ width:14px; height:14px; margin:0; accent-color:var(--primary); }}
             @media (max-width: 680px) {{
                 .container {{ padding-left: 8px; padding-right: 8px; }}
                 .ip-banner {{ display: none; }}
                 .filter-form {{ grid-template-columns: 1fr; }}
                 .filter-footer {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
+                .filter-meta {{ align-items:flex-start; flex-direction:column; gap:8px; }}
                 .filter-actions {{ display: grid; grid-template-columns: 1fr; gap: 10px; }}
                 .filter-action-group {{ display: grid; grid-template-columns: 1fr; gap: 10px; }}
                 .history-table {{ min-width: 680px; }}
@@ -968,7 +1021,10 @@ async def history(
                     <select id="categoryFilter" name="category" multiple placeholder="选择标签">{category_filter_options}</select>
                 </div>
                 <div class="filter-footer">
-                    <p class="filter-summary">当前显示 {filtered_count} 条记录</p>
+                    <div class="filter-meta">
+                        <p class="filter-summary">当前显示 {filtered_count} 条记录</p>
+                        <label class="checkbox-filter"><input type="checkbox" name="amortized" value="1" {amortized_checked}> 只看摊销</label>
+                    </div>
                     <div class="filter-actions">
                         <a class="btn-link btn-cancel" href="{clear_filter_url}">清空</a>
                         <button type="submit" class="btn-primary">查询</button>
@@ -1002,8 +1058,8 @@ async def history(
         amount_val = float(r[2] or 0.0)
         amount_form_val = format_export_amount(r[2])
         created_at_val = escape(str(r[10] or "未知"))
-        annual_checked = "checked" if int(r[11] or 1) == 12 else ""
-        annual_badge = " · 年摊" if annual_checked else ""
+        amortization_months_val = normalize_amortization_months(r[11] or 1, r[12] if len(r) > 12 else "expense")
+        amortization_badge = f" · {amortization_months_val}月摊" if amortization_months_val > 1 else ""
         current_record_type = normalize_record_type(r[12] if len(r) > 12 else "expense")
         record_type_text = escape(record_type_label(current_record_type))
         record_type_badge_class = "record-type-income" if current_record_type == "income" else "record-type-expense"
@@ -1023,7 +1079,7 @@ async def history(
                 f"<td><span class='record-type-badge {record_type_badge_class}'>{record_type_text}</span></td>" \
                 f"<td class='date-cell'>{created_at_val}</td>" \
                 f"<td class='date-cell'>{date_val or '未知'}</td>" \
-                f"<td><span class='compact-badge' title='{display_cat}{annual_badge}'>{display_cat}{annual_badge}</span></td>" \
+                f"<td><span class='compact-badge' title='{display_cat}{amortization_badge}'>{display_cat}{amortization_badge}</span></td>" \
                 f"<td class='amount-cell'>${amount_val:.2f}</td></tr>" \
                 f"<tr class='detail-row' id='detail-{r[0]}'><td colspan='7'>" \
                 f"<div class='history-detail'>" \
@@ -1032,7 +1088,7 @@ async def history(
                 f"<input type='hidden' name='id' value='{r[0]}'>" \
                 f"<input type='hidden' name='source' value='{escape(source_url)}'>" \
                 f"<div class='form-row'>" \
-                f"<div class='form-group'><label>记录类型</label><select name='record_type'>{record_type_options}</select></div>" \
+                f"<div class='form-group'><label>记录类型</label><select name='record_type' class='record-type-edit'>{record_type_options}</select></div>" \
                 f"<div class='form-group'><label>商户/来源</label><input type='text' name='merchant' value='{merchant_val}' required></div>" \
                 f"<div class='form-group'><label>标签</label><select name='category' class='category-edit'>{cat_options}</select></div>" \
                 f"</div>" \
@@ -1042,7 +1098,7 @@ async def history(
                 f"<div class='form-group'><label>税费 (Tax)</label><input type='number' min='0' step='0.01' name='tax' value='{tax_val}'></div>" \
                 f"</div>" \
                 f"<div class='form-group'><label>总金额 (Total)</label><input type='number' min='0' step='0.01' name='amount' value='{amount_form_val}' required></div>" \
-                f"<div class='form-group'><label><input type='checkbox' name='annual_expense' value='true' {annual_checked}> 年度支出（统计按 12 个月均摊）</label></div>" \
+                f"<div class='form-group amortization-field'><label>摊销月数</label><input type='number' min='1' max='120' step='1' name='amortization_months' inputmode='numeric' value='{amortization_months_val}'><div class='hint'>普通消费填 1；两月一交填 2；年费填 12。</div></div>" \
                 f"<button type='submit' class='btn-edit'>保存修改</button></form>" \
                 f"<form action='/spendmoney/delete' method='post' onsubmit=\"return confirm('确定要删除这条历史记录吗？');\">" \
                 f"<input type='hidden' name='id' value='{r[0]}'>" \
@@ -1120,6 +1176,14 @@ async def history(
                 const typeSelect = form.querySelector('.record-type-edit');
                 const categorySelect = form.querySelector('.category-edit');
                 if (!typeSelect || !categorySelect) return;
+                const amortizationField = form.querySelector('.amortization-field');
+                const amortizationInput = amortizationField ? amortizationField.querySelector('input[name="amortization_months"]') : null;
+                const isIncome = typeSelect.value === 'income';
+                if (amortizationField) amortizationField.classList.toggle('is-hidden', isIncome);
+                if (amortizationInput) {
+                    amortizationInput.disabled = isIncome;
+                    if (isIncome) amortizationInput.value = '1';
+                }
                 const selectedType = typeSelect.value;
                 let firstAllowedValue = '';
                 Array.from(categorySelect.options).forEach(function(option) {
@@ -1225,9 +1289,20 @@ async def export_csv(request: Request):
 async def manage_categories(request: Request):
     owner_user_id = get_owner_user_id(request)
     rows = get_category_rows(owner_user_id)
+    conn = sqlite3.connect('finance.db')
+    cursor = conn.cursor()
+    cursor.execute("""CREATE TABLE IF NOT EXISTS category_budgets
+                      (owner_user_id TEXT NOT NULL,
+                       category_code TEXT NOT NULL,
+                       monthly_budget REAL NOT NULL DEFAULT 0,
+                       PRIMARY KEY (owner_user_id, category_code))""")
+    cursor.execute("SELECT category_code, monthly_budget FROM category_budgets WHERE owner_user_id=?", (owner_user_id,))
+    budget_by_code = {str(code): float(amount or 0.0) for code, amount in cursor.fetchall()}
+    conn.commit()
+    conn.close()
     grouped = {"expense": [], "income": []}
     for code, name, category_type in rows:
-        grouped.setdefault(normalize_category_type(category_type), []).append((code, name))
+        grouped.setdefault(normalize_category_type(category_type), []).append((code, name, budget_by_code.get(str(code), 0.0)))
 
     html = f"""
     <!doctype html>
@@ -1239,10 +1314,18 @@ async def manage_categories(request: Request):
             .type-badge {{ display:inline-flex; align-items:center; justify-content:center; min-width:42px; padding:4px 9px; border-radius:999px; font-size:12px; font-weight:800; }}
             .type-expense {{ background:#fee2e2; color:#991b1b; }}
             .type-income {{ background:#dcfce7; color:#166534; }}
-            .category-section-title {{ display:flex; align-items:center; gap:8px; }}
-            .category-row {{ padding:16px 24px; }}
-            .category-form {{ display:flex; flex:1; gap:12px; align-items:flex-end; }}
-            @media (max-width: 680px) {{ .category-form {{ display:block; }} .category-row .form-row {{ display:block; }} }}
+            .category-section-title {{ display:flex; align-items:center; gap:8px; margin:18px 0 8px; }}
+            .category-table-wrap {{ overflow-x:auto; background:#fff; border:1px solid var(--border); border-radius:10px; box-shadow:0 2px 8px rgba(15,23,42,.04); margin-bottom:14px; }}
+            .category-grid {{ min-width:720px; }}
+            .category-grid-head, .category-line {{ display:grid; grid-template-columns:100px 110px minmax(180px, 1fr) 130px 150px; gap:10px; align-items:center; }}
+            .category-grid-head {{ padding:9px 12px; font-size:12px; color:var(--text-muted); background:#f8fafc; border-bottom:1px solid var(--border); font-weight:800; }}
+            .category-line {{ padding:8px 12px; border-bottom:1px solid #f1f5f9; margin:0; }}
+            .category-line:last-child {{ border-bottom:0; }}
+            .category-line input, .category-line select {{ min-height:32px; height:32px; padding:4px 8px; margin:0; font-size:13px; border-radius:6px; }}
+            .category-code {{ color:#64748b; background:#f8fafc; }}
+            .category-actions {{ display:flex; gap:8px; justify-content:flex-end; }}
+            .category-actions button {{ width:auto; min-height:32px; height:32px; padding:0 12px; margin:0; border-radius:8px; font-size:13px; }}
+            @media (max-width: 680px) {{ .category-grid {{ min-width:680px; }} }}
         </style>
     </head>
     <body>
@@ -1256,16 +1339,13 @@ async def manage_categories(request: Request):
             <a href="/nav/">🏠 返回主页</a>
         </div>
 
-        <div class="card" style="background: var(--primary); color: #fff; border:none;">
-            <h3 style="color: #fff; margin-top:0; border-bottom: 1px solid rgba(255,255,255,0.2);">新增标签</h3>
-            <p style="font-size: 13px; color: #cbd5e1; margin-bottom: 16px;">标签分为支出和收入两类；代码仍是底层唯一标识，建议收入使用 100 以上编号。</p>
-            <form action="/spendmoney/category_add" method="post">
-                <div class="form-row" style="align-items: flex-end;">
-                    <div class="form-group" style="margin-bottom:0;"><label style="color:#e2e8f0;">标签类型</label><select name="category_type"><option value="expense">支出</option><option value="income">收入</option></select></div>
-                    <div class="form-group" style="margin-bottom:0;"><label style="color:#e2e8f0;">唯一代码</label><input type="number" name="code" required></div>
-                    <div class="form-group" style="margin-bottom:0;"><label style="color:#e2e8f0;">显示名称</label><input type="text" name="name" required></div>
-                    <button type="submit" style="width:auto; margin-bottom:0; background: var(--success);">新建标签</button>
-                </div>
+        <div class="card" style="padding:14px 16px;">
+            <form action="/spendmoney/category_add" method="post" class="form-row" style="align-items:flex-end; margin:0; gap:10px;">
+                <div class="form-group" style="margin-bottom:0;"><label>类型</label><select name="category_type"><option value="expense">支出</option><option value="income">收入</option></select></div>
+                <div class="form-group" style="margin-bottom:0;"><label>代码</label><input type="number" name="code" required></div>
+                <div class="form-group" style="margin-bottom:0; flex:2;"><label>名称</label><input type="text" name="name" required></div>
+                <div class="form-group" style="margin-bottom:0;"><label>月预算</label><input type="number" step="0.01" min="0" name="monthly_budget" value="0"></div>
+                <button type="submit" style="width:auto; margin-bottom:0;">新增</button>
             </form>
         </div>
     """
@@ -1279,36 +1359,37 @@ async def manage_categories(request: Request):
         if not grouped.get(category_type):
             html += "<div class='card'><div style='text-align:center;color:var(--text-muted);padding:18px;'>暂无标签</div></div>"
             continue
-        for code, name in grouped[category_type]:
+        html += """
+        <div class='category-table-wrap'>
+            <div class='category-grid'>
+                <div class='category-grid-head'><span>代码</span><span>类型</span><span>名称</span><span>月预算</span><span style='text-align:right;'>操作</span></div>
+        """
+        for code, name, monthly_budget in grouped[category_type]:
             type_options = "".join([
                 f"<option value='{escape(type_code)}' {'selected' if type_code == category_type else ''}>{escape(type_label)}</option>"
                 for type_code, type_label in CATEGORY_TYPE_LABELS.items()
             ])
+            budget_disabled = "disabled" if category_type == "income" else ""
+            safe_code = escape(code)
             html += f"""
-            <div class='card category-row'>
-                <div class="form-row" style="align-items: flex-end; margin: 0;">
-                    <form action="/spendmoney/category_update" method="post" class="category-form">
-                        <div class="form-group" style="margin-bottom:0; flex:1;">
-                            <label>底层代码 (不可改)</label>
-                            <input type="text" name="code" value="{escape(code)}" readonly>
-                        </div>
-                        <div class="form-group" style="margin-bottom:0; flex:1;">
-                            <label>标签类型</label>
-                            <select name="category_type">{type_options}</select>
-                        </div>
-                        <div class="form-group" style="margin-bottom:0; flex:2;">
-                            <label>显示名称</label>
-                            <input type="text" name="name" value="{escape(name)}" required>
-                        </div>
-                        <button type="submit" class="btn-edit" style="width:auto; margin-bottom:0;">保存</button>
-                    </form>
-                    <form action="/spendmoney/category_delete" method="post" onsubmit="return confirm('删除标签后，旧数据将只显示底层数字代码。确定删除吗？');" style="margin:0;">
-                        <input type="hidden" name="code" value="{escape(code)}">
-                        <button type="submit" class="btn-danger" style="width:auto; margin-bottom:0;">删除</button>
-                    </form>
-                </div>
-            </div>
+                <form action="/spendmoney/category_update" method="post" class="category-line">
+                    <input class="category-code" type="text" name="code" value="{safe_code}" readonly>
+                    <select name="category_type">{type_options}</select>
+                    <input type="text" name="name" value="{escape(name)}" required>
+                    <input type="number" step="0.01" min="0" name="monthly_budget" value="{monthly_budget:.2f}" {budget_disabled}>
+                    <div class="category-actions">
+                        <button type="submit" class="btn-edit">保存</button>
+                        <button type="submit" class="btn-danger" form="delete-category-{safe_code}">删除</button>
+                    </div>
+                </form>
+                <form id="delete-category-{safe_code}" action="/spendmoney/category_delete" method="post" onsubmit="return confirm('删除标签后，旧数据将只显示底层数字代码。确定删除吗？');" style="display:none;">
+                    <input type="hidden" name="code" value="{safe_code}">
+                </form>
             """
+        html += """
+            </div>
+        </div>
+        """
 
     return html + "</div></body></html>"
 
@@ -1317,7 +1398,8 @@ async def category_add(
     request: Request,
     code: str = Form(...),
     name: str = Form(...),
-    category_type: str = Form("expense")
+    category_type: str = Form("expense"),
+    monthly_budget: float = Form(0.0)
 ):
     owner_user_id = get_owner_user_id(request)
     category_type = normalize_category_type(category_type)
@@ -1328,6 +1410,11 @@ async def category_add(
             "INSERT INTO categories (owner_user_id, code, name, category_type) VALUES (?, ?, ?, ?)",
             (owner_user_id, code.strip(), name.strip(), category_type)
         )
+        if category_type == "expense" and monthly_budget > 0:
+            cursor.execute(
+                "INSERT OR REPLACE INTO category_budgets (owner_user_id, category_code, monthly_budget) VALUES (?, ?, ?)",
+                (owner_user_id, code.strip(), monthly_budget)
+            )
         conn.commit()
     except sqlite3.IntegrityError:
         pass
@@ -1339,7 +1426,8 @@ async def category_update(
     request: Request,
     code: str = Form(...),
     name: str = Form(...),
-    category_type: str = Form("expense")
+    category_type: str = Form("expense"),
+    monthly_budget: float = Form(0.0)
 ):
     owner_user_id = get_owner_user_id(request)
     category_type = normalize_category_type(category_type)
@@ -1349,6 +1437,13 @@ async def category_update(
         "UPDATE categories SET name=?, category_type=? WHERE owner_user_id=? AND code=?",
         (name.strip(), category_type, owner_user_id, code)
     )
+    if category_type == "expense" and monthly_budget > 0:
+        cursor.execute(
+            "INSERT OR REPLACE INTO category_budgets (owner_user_id, category_code, monthly_budget) VALUES (?, ?, ?)",
+            (owner_user_id, code, monthly_budget)
+        )
+    else:
+        cursor.execute("DELETE FROM category_budgets WHERE owner_user_id=? AND category_code=?", (owner_user_id, code))
     conn.commit()
     conn.close()
     return """<script>window.location.href='/spendmoney/categories';</script>"""
@@ -1359,6 +1454,7 @@ async def category_delete(request: Request, code: str = Form(...)):
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
     cursor.execute("DELETE FROM categories WHERE owner_user_id=? AND code=?", (owner_user_id, code))
+    cursor.execute("DELETE FROM category_budgets WHERE owner_user_id=? AND category_code=?", (owner_user_id, code))
     conn.commit()
     conn.close()
     return """<script>window.location.href='/spendmoney/categories';</script>"""
@@ -1512,12 +1608,15 @@ async def manual_add(
     subtotal: float = Form(0.0),
     tax: float = Form(0.0),
     amount: float = Form(...),
-    category: str = Form("0"),
+    category: str = Form(""),
     record_type: str = Form("expense"),
-    annual_expense: bool = Form(False)
+    amortization_months: int = Form(1)
 ):
     owner_user_id = get_owner_user_id(request)
     record_type = normalize_record_type(record_type)
+    category = str(category or "").strip()
+    if not category:
+        return validation_error_page("请选择分类标签", "保存前需要明确选择一个标签，避免误存到默认分类。", "/spendmoney/")
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
     filename = f"manual_{uuid.uuid4().hex}"
@@ -1526,7 +1625,7 @@ async def manual_add(
     
     cursor.execute(
         "INSERT INTO records (owner_user_id, filename, amount, merchant, date, subtotal, tax, category, raw_text, status, created_at, amortization_months, record_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'), ?, ?)",
-        (owner_user_id, filename, amount, merchant, date, subtotal, tax, category, raw_text, status, 12 if annual_expense else 1, record_type)
+        (owner_user_id, filename, amount, merchant, date, subtotal, tax, category, raw_text, status, normalize_amortization_months(amortization_months, record_type), record_type)
     )
     conn.commit()
     conn.close()
@@ -1555,17 +1654,20 @@ async def update(
     date: str = Form(""),
     subtotal: float = Form(0.0),
     tax: float = Form(0.0),
-    category: str = Form("0"),
+    category: str = Form(""),
     record_type: str = Form("expense"),
-    annual_expense: bool = Form(False),
+    amortization_months: int = Form(1),
     source: str = Form("/spendmoney/")
 ):
     owner_user_id = get_owner_user_id(request)
     record_type = normalize_record_type(record_type)
+    category = str(category or "").strip()
+    if not category:
+        return validation_error_page("请选择分类标签", "保存前需要明确选择一个标签，避免误存到默认分类。", source)
     conn = sqlite3.connect('finance.db')
     cursor = conn.cursor()
     cursor.execute("UPDATE records SET amount=?, merchant=?, date=?, subtotal=?, tax=?, category=?, record_type=?, amortization_months=?, status='confirmed' WHERE id=? AND owner_user_id=?",
-                   (amount, merchant, date, subtotal, tax, category, record_type, 12 if annual_expense else 1, id, owner_user_id))
+                   (amount, merchant, date, subtotal, tax, category, record_type, normalize_amortization_months(amortization_months, record_type), id, owner_user_id))
     conn.commit()
     conn.close()
     return f"""
@@ -1658,7 +1760,7 @@ async def receive_iphone_receipt(request: Request):
         tax = float(receipt_info.get('tax', 0.00))
         total = float(receipt_info.get('total', 0.00))
         
-        category_code = "0"
+        category_code = ""
         status = "processed" 
         virtual_filename = f"iphone_ai_{uuid.uuid4().hex[:8]}"
         raw_text_for_db = f"【iPhone 端侧 AI 原始解析】\n{json.dumps(receipt_info, indent=2, ensure_ascii=False)}"

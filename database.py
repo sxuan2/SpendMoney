@@ -102,6 +102,12 @@ def init_db():
                        label TEXT DEFAULT '',
                        is_active INTEGER NOT NULL DEFAULT 1,
                        created_at TEXT DEFAULT (datetime('now', 'localtime')))""")
+
+    cursor.execute("""CREATE TABLE IF NOT EXISTS category_budgets
+                      (owner_user_id TEXT NOT NULL,
+                       category_code TEXT NOT NULL,
+                       monthly_budget REAL NOT NULL DEFAULT 0,
+                       PRIMARY KEY (owner_user_id, category_code))""")
         
     conn.commit()
     conn.close()
