@@ -17,6 +17,8 @@ from fastapi.staticfiles import StaticFiles
 from dashboard_stats import build_dashboard_stats
 from database import DEFAULT_OWNER_USER_ID, init_db
 from processor import process_receipt_file, UPLOAD_DIR, PROCESSED_DIR
+from portfolio_web import router as portfolio_router
+from portfolio_api import router as portfolio_api_router
 from PIL import Image, ImageOps
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -24,6 +26,8 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 app = FastAPI()
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.mount("/processed", StaticFiles(directory=PROCESSED_DIR), name="processed")
+app.include_router(portfolio_router)
+app.include_router(portfolio_api_router)
 
 CATEGORY_TYPE_LABELS = {"expense": "支出", "income": "收入"}
 RECORD_TYPE_LABELS = {"expense": "支出", "income": "收入"}
@@ -527,6 +531,7 @@ async def render_dashboard(request: Request, month: Optional[str] = None):
             <a href="/spendmoney/">🧾 上传与待办</a>
             <a href="/spendmoney/history">🗄️ 历史台账</a>
             <a href="/spendmoney/categories">🏷️ 标签管理</a>
+            <a href="/spendmoney/portfolio">💼 资产组合</a>
             <a href="/nav/">🏠 返回主页</a>
         </div>
 
@@ -665,6 +670,7 @@ async def dashboard_main(request: Request):
             <a href="/spendmoney/" class="active">🧾 上传与待办</a>
             <a href="/spendmoney/history">🗄️ 历史台账</a>
             <a href="/spendmoney/categories">🏷️ 标签管理</a>
+            <a href="/spendmoney/portfolio">💼 资产组合</a>
             <a href="/nav/">🏠 返回主页</a>
         </div>
         
@@ -995,6 +1001,7 @@ async def history(
             <a href="/spendmoney/">🧾 上传与待办</a>
             <a href="/spendmoney/history" class="active">🗄️ 历史台账</a>
             <a href="/spendmoney/categories">🏷️ 标签管理</a>
+            <a href="/spendmoney/portfolio">💼 资产组合</a>
             <a href="/nav/">🏠 返回主页</a>
         </div>
         
@@ -1336,6 +1343,7 @@ async def manage_categories(request: Request):
             <a href="/spendmoney/">🧾 上传与待办</a>
             <a href="/spendmoney/history">🗄️ 历史台账</a>
             <a href="/spendmoney/categories" class="active">🏷️ 标签管理</a>
+            <a href="/spendmoney/portfolio">💼 资产组合</a>
             <a href="/nav/">🏠 返回主页</a>
         </div>
 

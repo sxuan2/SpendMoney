@@ -108,6 +108,75 @@ def init_db():
                        category_code TEXT NOT NULL,
                        monthly_budget REAL NOT NULL DEFAULT 0,
                        PRIMARY KEY (owner_user_id, category_code))""")
+
+    # 投资组合：账户、证券、不可变交易流水和历史价格。
+    cursor.execute("""CREATE TABLE IF NOT EXISTS investment_accounts
+                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       owner_user_id TEXT NOT NULL,
+                       name TEXT NOT NULL,
+                       account_type TEXT NOT NULL DEFAULT 'investment',
+                       currency TEXT NOT NULL DEFAULT 'CAD',
+                       initial_cash REAL NOT NULL DEFAULT 0,
+                       is_active INTEGER NOT NULL DEFAULT 1,
+                       created_at TEXT DEFAULT (datetime('now', 'localtime')))""")
+    cursor.execute("""CREATE TABLE IF NOT EXISTS securities
+                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       owner_user_id TEXT NOT NULL,
+                       symbol TEXT NOT NULL,
+                       exchange TEXT NOT NULL DEFAULT '',
+                       name TEXT NOT NULL DEFAULT '',
+                       asset_type TEXT NOT NULL DEFAULT 'stock',
+                       currency TEXT NOT NULL DEFAULT 'CAD',
+                       is_active INTEGER NOT NULL DEFAULT 1,
+                       created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                       UNIQUE(owner_user_id, symbol, exchange))""")
+    cursor.execute("""CREATE TABLE IF NOT EXISTS investment_transactions
+                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       owner_user_id TEXT NOT NULL,
+                       account_id INTEGER NOT NULL,
+                       security_id INTEGER,
+                       transaction_type TEXT NOT NULL,
+                       trade_date TEXT NOT NULL,
+                       quantity REAL NOT NULL DEFAULT 0,
+                       price REAL NOT NULL DEFAULT 0,
+                       amount REAL NOT NULL DEFAULT 0,
+                       fee REAL NOT NULL DEFAULT 0,
+                       currency TEXT NOT NULL DEFAULT 'CAD',
+                       note TEXT NOT NULL DEFAULT '',
+                       created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                       FOREIGN KEY(account_id) REFERENCES investment_accounts(id),
+                       FOREIGN KEY(security_id) REFERENCES securities(id))""")
+    transaction_columns = {row[1] for row in cursor.execute("PRAGMA table_info(investment_transactions)")}
+    if "import_key" not in transaction_columns:
+        cursor.execute("ALTER TABLE investment_transactions ADD COLUMN import_key TEXT")
+    if "import_source" not in transaction_columns:
+        cursor.execute("ALTER TABLE investment_transactions ADD COLUMN import_source TEXT NOT NULL DEFAULT ''")
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_investment_transactions_import_key ON investment_transactions(owner_user_id, import_key) WHERE import_key IS NOT NULL")
+    cursor.execute("""CREATE TABLE IF NOT EXISTS security_prices
+                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       owner_user_id TEXT NOT NULL,
+                       security_id INTEGER NOT NULL,
+                       price REAL NOT NULL,
+                       currency TEXT NOT NULL,
+                       quoted_at TEXT NOT NULL,
+                       source TEXT NOT NULL DEFAULT '',
+                       created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                       UNIQUE(owner_user_id, security_id, quoted_at, source),
+                       FOREIGN KEY(security_id) REFERENCES securities(id))""")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_investment_transactions_owner_date ON investment_transactions(owner_user_id, trade_date, id)")
+    cursor.execute("""CREATE TABLE IF NOT EXISTS exchange_rates
+                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       owner_user_id TEXT NOT NULL,
+                       base_currency TEXT NOT NULL,
+                       quote_currency TEXT NOT NULL,
+                       rate REAL NOT NULL,
+                       quoted_at TEXT NOT NULL,
+                       source TEXT NOT NULL,
+                       created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                       UNIQUE(owner_user_id, base_currency, quote_currency, quoted_at, source))""")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_exchange_rates_latest ON exchange_rates(owner_user_id, base_currency, quote_currency, quoted_at DESC)")
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_security_prices_latest ON security_prices(owner_user_id, security_id, quoted_at DESC)")
         
     conn.commit()
     conn.close()
